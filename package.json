@@ -1,11 +1,11 @@
 {
 	"name": "rocketride-server",
-	"version": "3.3.0",
+	"version": "3.4.0",
 	"description": "RocketRide Server - A high-performance data processing engine with modular nodes, AI capabilities, and cross-platform clients",
 	"private": true,
 	"license": "MIT",
 	"vcpkg": {
-		"version": "2026.04.27"
+		"version": "2026.07.29"
 	},
 	"java": {
 		"jdkVersion": "17",

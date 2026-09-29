@@ -54,6 +54,13 @@ class AccountBase(ABC):
     # and copied into every AccountInfo returned by authenticate().
     capabilities: tuple[str, ...] = ()
 
+    # Whether the @public rung is gated behind the review ladder (submit ->
+    # admin approve -> 'ready'). SaaS keeps the ladder; OSS overrides to
+    # False so a single-operator server can publish to its own store
+    # directly. Consulted by the app_deploy publish gate — the DEFAULT is
+    # the safe, gated behavior.
+    review_ladder: bool = True
+
     # =========================================================================
     # ABSTRACT — must be implemented by both OSS and SaaS
     # =========================================================================
@@ -428,7 +435,9 @@ class AccountBase(ABC):
                 body = json.loads(response.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             # 4xx = unknown/invalid tenant per the broker contract; 5xx = broker fault.
-            raise RuntimeError(f'DB broker rejected provision for this account (HTTP {e.code})') from e
+            code = e.code
+            e.close()
+            raise RuntimeError(f'DB broker rejected provision for this account (HTTP {code})') from e
         except Exception as e:
             raise RuntimeError(f'DB broker unreachable: {e}') from e
 

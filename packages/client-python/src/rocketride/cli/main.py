@@ -30,6 +30,8 @@ Command surface (kept in exact parity with the TypeScript client's CLI):
     list                       List active tasks
     start / stop / upload      Task lifecycle
     validate <files...>        Validate pipeline files (CI-friendly exit codes)
+    otel                       OpenTelemetry bridge: traces + metrics over OTLP
+    diff <old> <new>           Semantic .pipe diff (fully local; no server)
     store dir/type/write/...   File store operations
     app create/deploy/verify   App lifecycle
     deploy add/list/publish/.. Deploy lifecycle (deployment target)
@@ -59,13 +61,18 @@ from .utils.env import (
 )
 
 
-def _add_connection_args(parser: argparse.ArgumentParser) -> None:
+def _add_connection_args(parser: argparse.ArgumentParser, *, json_arg: bool = True) -> None:
     """
     Add the development-connection options (``--uri``, ``--apikey``,
     ``--json``) with defaults from the (already loaded) environment.
 
     Args:
         parser: The subcommand parser to extend.
+        json_arg: Whether to add the shared ``--json [FILE]`` option. Pass
+            False for a command that defines its own ``--json`` as a plain
+            format flag rather than the shared result envelope (argparse
+            would otherwise reject the duplicate option string), or for one
+            that produces no JSON result at all.
     """
     from ..core.constants import CONST_DEFAULT_WEB_LOCAL
 
@@ -79,7 +86,8 @@ def _add_connection_args(parser: argparse.ArgumentParser) -> None:
         default=os.getenv(ENV_DEV_APIKEY),
         help=f'API key for server authentication (can use {ENV_DEV_APIKEY} in .env or env var)',
     )
-    _add_json_arg(parser)
+    if json_arg:
+        _add_json_arg(parser)
 
 
 def _add_deploy_connection_args(parser: argparse.ArgumentParser) -> None:
@@ -231,6 +239,142 @@ def setup_parser() -> argparse.ArgumentParser:
     _add_connection_args(validate_parser)
     validate_parser.add_argument('files', nargs='+', help='Pipeline .pipe files or glob patterns to validate')
     validate_parser.add_argument('--source', default=None, help='Override source component ID for validation')
+
+    # ── otel ─────────────────────────────────────────────────────────────
+    # A long-running foreground bridge: it streams to an OTLP collector and
+    # emits no JSON result, so it takes the connection args without the
+    # shared --json [FILE] option.
+    otel_parser = subparsers.add_parser(
+        'otel',
+        help='Export pipeline traces and metrics to an OpenTelemetry collector',
+        epilog=(
+            "Requires the OpenTelemetry extra: pip install 'rocketride[otel]'. "
+            'Exit codes: 0 = graceful shutdown; 1 = unexpected failure; 2 = missing extra, '
+            'refused cleartext credential transport, or startup connection failure.'
+        ),
+    )
+    _add_connection_args(otel_parser, json_arg=False)
+
+    # OTLP endpoint base URL (signal paths are appended automatically)
+    otel_parser.add_argument(
+        '--endpoint',
+        default=None,
+        help='OTLP endpoint base URL (default: OTEL_EXPORTER_OTLP_ENDPOINT or http://localhost:4318)',
+    )
+
+    # OTLP transport protocol
+    otel_parser.add_argument(
+        '--protocol',
+        choices=['http', 'grpc'],
+        default='http',
+        help='OTLP transport protocol (default: %(default)s)',
+    )
+
+    # service.name resource attribute
+    otel_parser.add_argument(
+        '--service-name',
+        dest='service_name',
+        default=None,
+        help='service.name resource attribute (default: OTEL_SERVICE_NAME or rocketride-engine)',
+    )
+
+    # OTLP headers for collector authentication (Langfuse, LangSmith, ...)
+    otel_parser.add_argument(
+        '--headers',
+        default=None,
+        help='OTLP headers as comma-separated key=value pairs (default: OTEL_EXPORTER_OTLP_HEADERS)',
+    )
+
+    # Privacy gate: payload content is excluded from spans by default
+    otel_parser.add_argument(
+        '--include-content',
+        dest='include_content',
+        action='store_true',
+        help='Include pipeline payload content in spans, size-capped (default: content excluded)',
+    )
+
+    # Transport-security opt-out for the cleartext-credential guard
+    otel_parser.add_argument(
+        '--insecure',
+        action='store_true',
+        help='Allow exporting OTLP credential headers over cleartext transport to a '
+        'non-loopback collector (default: refuse; also ROCKETRIDE_OTEL_ALLOW_INSECURE=1)',
+    )
+
+    # Metrics toggle: traces-only export
+    otel_parser.add_argument(
+        '--no-metrics',
+        dest='no_metrics',
+        action='store_true',
+        help='Disable metrics export; export traces only',
+    )
+
+    # Informational only: the bridge cannot set the trace level of runs
+    # it did not start (pipelineTraceLevel is an execute-time argument)
+    otel_parser.add_argument(
+        '--trace-level',
+        dest='trace_level',
+        choices=['none', 'metadata', 'summary', 'full'],
+        default=None,
+        help='Informational only: FLOW spans require runs started with pipelineTraceLevel; '
+        'the bridge cannot change the trace level of running tasks',
+    )
+
+    # ── diff ─────────────────────────────────────────────────────────────
+    # This command is intentionally *local only*: it never contacts the engine
+    # or the network, so it does NOT take the shared --uri/--apikey connection
+    # arguments (_add_connection_args) that every other command uses, and its
+    # --json is a plain format flag rather than the shared --json [FILE].
+    diff_parser = subparsers.add_parser(
+        'diff',
+        help='Semantic diff of two .pipe pipeline files (local; no server)',
+        description=(
+            'Compare two RocketRide .pipe pipeline files semantically, surfacing node, '
+            'edge, and config changes while ignoring canvas layout noise (the per-node '
+            '"ui" block and top-level "viewport"). This command runs entirely locally '
+            'and never connects to the engine or network, so it takes no '
+            '--uri/--apikey arguments.'
+        ),
+        epilog=(
+            'Exit codes: 0 = no semantic changes (or --exit-zero); 1 = semantic changes found; '
+            '2 = usage error, or an unreadable/unparseable file or bad git ref.'
+        ),
+    )
+    diff_parser.add_argument(
+        'paths',
+        nargs='*',
+        metavar='FILE',
+        help='Two pipe files to compare (old new), or a single FILE when using --git',
+    )
+    diff_parser.add_argument(
+        '--git',
+        metavar='REF',
+        help='Diff the working-tree FILE against this git ref (via "git show REF:FILE")',
+    )
+    diff_parser.add_argument(
+        '--include-layout',
+        action='store_true',
+        help='Include layout churn (per-node "ui" blocks and top-level "viewport") ignored by default',
+    )
+
+    # --json and --markdown select mutually exclusive output formats.
+    diff_format_group = diff_parser.add_mutually_exclusive_group()
+    diff_format_group.add_argument(
+        '--json',
+        action='store_true',
+        help='Emit the diff as a single JSON document to stdout',
+    )
+    diff_format_group.add_argument(
+        '--markdown',
+        action='store_true',
+        help='Emit the diff as compact, PR-comment-friendly Markdown to stdout',
+    )
+
+    diff_parser.add_argument(
+        '--exit-zero',
+        action='store_true',
+        help='Always exit 0 on a successful run, even when changes are found (non-gating)',
+    )
 
     # ── store ────────────────────────────────────────────────────────────
     store_parser = subparsers.add_parser('store', help='File store operations')
@@ -421,6 +565,8 @@ async def _dispatch(args) -> int:
     from .commands.app import run_app
     from .commands.auth import run_init, run_login
     from .commands.deploy import run_deploy
+    from .commands.diff import run_diff
+    from .commands.otel import run_otel
     from .commands.store import run_store
     from .commands.tasks import run_list, run_start, run_stop, run_upload
     from .commands.validate import run_validate
@@ -439,6 +585,10 @@ async def _dispatch(args) -> int:
         return await run_upload(args)
     if args.command == 'validate':
         return await run_validate(args)
+    if args.command == 'otel':
+        return await run_otel(args)
+    if args.command == 'diff':
+        return await run_diff(args)
     if args.command == 'store':
         if not getattr(args, 'store_subcommand', None):
             print('Error: Store subcommand is required (dir, type, write, rm, mkdir, stat)', file=sys.stderr)

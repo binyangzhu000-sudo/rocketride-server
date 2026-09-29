@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — since 2026-09-22
+
+## [3.4.0] - 2026-09-22
 
 <!-- Everything below ships in the next release. There is deliberately no
      [3.4.0] section here: that release was cut on `stage` (#1654) and then
@@ -22,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: on-demand + monthly multi-OS compile/test matrix (#1537)
 - **ci**: keep Discord forum tags live (re-apply on state/label change via bot) (#1722)
 - **cli**: rocketride validate subcommand (Python + TS) + validate-pipes composite action (#1573)
+- **client-python**: `rocketride diff` — semantic `.pipe` diff + pipe-diff composite action (#1607)
+- **client-python**: `rocketride otel` — OpenTelemetry bridge over the ingester protocol (#1612)
 - **database**: Sequelize ORM over pipes + server-side DB transactions (#1467)
 - **deploy-2**: teams-as-environments deploy, owner-scoped task identity, push-driven surfaces (#1764)
 - **events-ui**: real-time DAP event monitor micro-frontend (#1484)
@@ -32,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **nodes**: add authoritative_overlay SEC period-scoped cross-check guard (#1430)
 - **nodes**: add chunker — sentence-boundary and tiktoken-based text chunking with configurable overlap and per-chunk character offsets; recursive character splitting stays with the General Text (`preprocessor_langchain`) node (#897)
 - **nodes**: add cognee node (#1501)
+- **nodes**: add context_optimizer node — fits questions into the model context window by token budget (#1489)
 - **nodes**: add currency_convert_explicit node (#1497)
 - **nodes**: add discord — Discord Bot source node over the Gateway; routes messages and image/audio/video/document attachments to the text/image/audio/video/tags lanes and posts the pipeline's first answer back as a reply, channel message, or thread (#1503)
 - **nodes**: add extract_facts node — document-context + cell-by-cell reader + validator (#1426) (#1545)
