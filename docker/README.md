@@ -122,4 +122,8 @@ All three are tagged with the engine version, and the two upper ones are built
 FROM the engine-base of that version (`--build-arg ENGINE_BASE=...`). On Linux,
 `./builder nodes:build-container` builds engine-base and the node image from
 the local `dist/server`; elsewhere `dist/server` is not a Linux engine and the
-task skips.
+task skips. `./builder nodes:test-container` builds them and checks the node
+image as a run gets it: with capabilities dropped the engine is non-dumpable,
+the shipped constraints are accepted as they are, and a sample of nodes installs
+from the wheel cache with no network. CI runs it on Linux when the image's
+inputs change.
