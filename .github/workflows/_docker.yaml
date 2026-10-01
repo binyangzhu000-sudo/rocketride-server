@@ -81,12 +81,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The base the engine image (and the node image) is built FROM. Published
+      # under the same tag rules, so a pulled engine-base matches its engine.
+      # Its build runs the engine, so a tree without its runtime libs stops here.
+      - name: Build and push engine-base
+        id: base
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.engine-base
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/rocketride-engine-base:${{ inputs.server_version }}${{ inputs.tag_suffix != '' && format('-{0}', inputs.tag_suffix) || (inputs.prerelease && '-prerelease' || '') }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.revision.outputs.sha }}
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: docker/Dockerfile.engine
+          build-args: |
+            ENGINE_BASE=ghcr.io/${{ github.repository_owner }}/rocketride-engine-base@${{ steps.base.outputs.digest }}
           push: true
           platforms: linux/amd64
           # Three mutually exclusive shapes, in priority order:

@@ -109,3 +109,17 @@ Named volumes persist data between restarts:
 | miniodata  | minio    | Object storage       |
 | milvusdata | milvus   | Vector index data    |
 | chromadata | chroma   | ChromaDB persistence |
+
+## Images
+
+| File | Image | Purpose |
+| ---- | ----- | ------- |
+| `Dockerfile.engine-base` | `rocketride-engine-base` | The engine from `dist/server`, its Python baseline installed, the libc++ load check. No entrypoint. |
+| `Dockerfile.engine` | `rocketride-engine` | The server: engine-base plus `static/`, runs `ai/eaas.py`. |
+| `Dockerfile.node` | `rocketride/node` | One pipeline task: engine-base plus a warmed uv wheel cache; tini, no command. |
+
+All three are tagged with the engine version, and the two upper ones are built
+FROM the engine-base of that version (`--build-arg ENGINE_BASE=...`). On Linux,
+`./builder nodes:build-container` builds engine-base and the node image from
+the local `dist/server`; elsewhere `dist/server` is not a Linux engine and the
+task skips.

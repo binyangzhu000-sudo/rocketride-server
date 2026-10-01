@@ -52,7 +52,9 @@ const {
     collectPytestReport,
     parallel,
     bracket,
-    parseServerAddress
+    parseServerAddress,
+    isLinux,
+    loadPackageJson
 } = require('../../scripts/lib');
 
 const PACKAGE_DIR = path.join(__dirname, '..');
@@ -396,6 +398,45 @@ function makeTestAction(options = {}) {
     return { description: 'Testing nodes', steps };
 }
 
+// Builds engine-base from dist/server, then the node image FROM it, both tagged
+// with the engine version. Linux only: elsewhere dist/server holds a Windows or
+// macOS engine, which cannot go into a Linux image.
+function makeBuildImageAction(options = {}) {
+    return {
+        run: async (ctx, task) => {
+            const skip = (reason) => {
+                task.output = `Skipped: ${reason}`;
+                console.warn(`WARNING: nodes:build-container did not build an image — ${reason}`);
+            };
+            if (!isLinux()) {
+                return skip('Linux only; dist/server here is not a Linux engine. Pull a published engine-base instead');
+            }
+            try {
+                await execCommand('docker', ['info'], { stdio: 'ignore', silent: true });
+            } catch {
+                return skip('no Docker daemon reachable');
+            }
+
+            const { version } = await loadPackageJson();
+            const base = `rocketride/engine-base:${version}`;
+            const node = `rocketride/node:${version}`;
+            const dockerDir = path.join(PROJECT_ROOT, 'docker');
+            // The per-Dockerfile .dockerignore files need BuildKit
+            const env = { ...process.env, DOCKER_BUILDKIT: '1' };
+
+            task.output = `Building ${base}...`;
+            await execCommand('docker', ['build', '-f', path.join(dockerDir, 'Dockerfile.engine-base'), '-t', base, path.dirname(DIST_ROOT)],
+                { task, env, verbose: options.verbose });
+
+            task.output = `Building ${node}...`;
+            await execCommand('docker', ['build', '-f', path.join(dockerDir, 'Dockerfile.node'), '--build-arg', `ENGINE_BASE=${base}`, '-t', node, PROJECT_ROOT],
+                { task, env, verbose: options.verbose });
+
+            task.output = `Built ${node}`;
+        }
+    };
+}
+
 // ============================================================================
 // Module Export
 // ============================================================================
@@ -418,6 +459,10 @@ module.exports = {
         { name: 'nodes:build', action: () => ({
             description: 'Build nodes',
             steps: ['server:build', 'nodes:sync', 'nodes:docs-generate', 'nodes:credentials-generate']
+        })},
+        { name: 'nodes:build-container', action: (options) => ({
+            description: 'Build the node container image',
+            steps: ['nodes:build', { name: 'nodes:build-image', action: makeBuildImageAction(options) }]
         })},
         { name: 'nodes:test', action: (options) => makeTestAction({ ...options, test_full: false }) },
         { name: 'nodes:test-full', action: (options) => makeTestAction({ ...options, test_full: true }) },
