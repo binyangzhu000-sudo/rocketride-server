@@ -112,18 +112,17 @@ Named volumes persist data between restarts:
 
 ## Images
 
-| File | Image | Purpose |
-| ---- | ----- | ------- |
-| `Dockerfile.engine-base` | `rocketride-engine-base` | The engine from `dist/server`, its Python baseline installed, the libc++ load check. No entrypoint. |
-| `Dockerfile.engine` | `rocketride-engine` | The server: engine-base plus `static/`, runs `ai/eaas.py`. |
-| `Dockerfile.node` | `rocketride/node` | One pipeline task: engine-base plus a warmed uv wheel cache; tini, no command. |
+| File | Built locally as | Published as | Purpose |
+| ---- | ---------------- | ------------ | ------- |
+| `Dockerfile.engine-base` | `rocketride/engine-base:<version>` (`nodes:build-container`), `rocketride/engine-base:local` (compose) | `ghcr.io/rocketride-org/rocketride-engine-base:<version>` | The engine from `dist/server`, its Python baseline installed, the libc++ load check. No entrypoint. |
+| `Dockerfile.engine` | the compose `engine` service | `ghcr.io/rocketride-org/rocketride-engine:<version>` and `latest` | The server: engine-base plus `static/`, runs `ai/eaas.py`. |
+| `Dockerfile.node` | `rocketride/node:<version>` (`nodes:build-container`) | not published yet | One pipeline task: engine-base plus a warmed uv wheel cache; tini, no command. |
 
-All three are tagged with the engine version, and the two upper ones are built
-FROM the engine-base of that version (`--build-arg ENGINE_BASE=...`). On Linux,
-`./builder nodes:build-container` builds engine-base and the node image from
-the local `dist/server`; elsewhere `dist/server` is not a Linux engine and the
-task skips. `./builder nodes:test-container` builds them and checks the node
-image as a run gets it: with capabilities dropped the engine is non-dumpable,
-the shipped constraints are accepted as they are, and a sample of nodes installs
-from the wheel cache with no network. CI runs it on Linux when the image's
-inputs change.
+The engine and node images are built FROM the engine-base of the same version
+(`--build-arg ENGINE_BASE=...`). On Linux, `./builder nodes:build-container`
+builds engine-base and the node image from the local `dist/server`; elsewhere
+`dist/server` is not a Linux engine and the task skips. `./builder
+nodes:test-container` builds them and checks the node image as a run gets it:
+with capabilities dropped the engine is non-dumpable, the shipped constraints
+are accepted as they are, and a sample of nodes installs from the wheel cache
+with no network. CI runs it on Linux when the image's inputs change.
