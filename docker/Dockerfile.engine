@@ -16,12 +16,8 @@ FROM ${ENGINE_BASE}
 
 COPY --chown=rocketride:rocketride dist/server/static/ /opt/rocketride/static/
 
-# Engine writes runtime data to /opt/data; create it writable for the
-# non-root user (root owns /opt) and persist it. See #1295.
-USER root
-RUN mkdir -p /opt/data && chown -R rocketride:rocketride /opt/data
+# The server's task data persists; engine-base created it writable. See #1295.
 VOLUME /opt/data
-USER rocketride
 
 EXPOSE 5565
 

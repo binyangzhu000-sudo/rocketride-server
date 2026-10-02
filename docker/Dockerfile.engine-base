@@ -60,6 +60,9 @@ COPY --from=tree /opt/rocketride /opt/rocketride
 # The sticky, group-writable root: uid 1000 can create what installs need there
 # (uv writes <prefix>/share) but cannot rename or replace root's files.
 RUN chown root:rocketride /opt/rocketride && chmod 1775 /opt/rocketride
+# Every task's paths.base (CONST_TASK_DATA_PATH, <engine>/../data). root owns
+# /opt, so without this no task can start in an image built from the base.
+RUN mkdir /opt/data && chown rocketride:rocketride /opt/data
 
 # Fail closed: find's result goes into a plain assignment, so an error from find
 # itself aborts the build instead of passing an unscanned tree.
