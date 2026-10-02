@@ -68,20 +68,13 @@
 #include "./filters/pipe/pipe.hpp"
 #include "./python/python-base.hpp"
 
-#include "./endpoints/azure/azure.hpp"
 #include "./endpoints/filesys/filesys/filesys.hpp"
 #include "./endpoints/filesys/smb/smb.hpp"
-#include "./endpoints/objstore/s3/s3.hpp"
-#include "./endpoints/objstore/objstore/objstore.hpp"
 #include "./endpoints/null/null.hpp"
 #include "./endpoints/zip/zip.hpp"
 #include "./endpoints/python/python.hpp"
 
 #include "./filters/bottom/bottom.hpp"
-#include "./filters/classify/classify.hpp"
-#include "./filters/hash/hash.hpp"
-#include "./filters/indexer/indexer.hpp"
-#include "./filters/parse/parse.hpp"
 
 #include "./endpoints/msServices/outlook/constants.hpp"
 #include "./endpoints/msServices/msConnector/MsConnector.hpp"
@@ -92,6 +85,12 @@
 #include "./endpoints/msServices/outlook/base.hpp"
 
 #include "./pipeline/validate_pipeline.hpp"
+
+// The filter test harness. It lives in the module so that a test binary
+// hosting engine.dll reaches the internals it drives, rather than the engine
+// exporting each of them
+#include "./testing/init.hpp"
+#include "./testing/container.hpp"
 
 namespace engine::store {
 Error init() noexcept;

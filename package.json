@@ -11,9 +11,6 @@
 		"jdkVersion": "17",
 		"mavenVersion": "3.9.6"
 	},
-	"tika": {
-		"version": "3.2.3"
-	},
 	"author": "rocketride.org",
 	"repository": {
 		"type": "git",
@@ -59,6 +56,7 @@
 		"gitignore-globs": "^0.1.1",
 		"glob": "^11.0.0",
 		"globals": "^15.12.0",
+		"jsonc-parser": "^3.3.1",
 		"lefthook": "^2.1.8",
 		"listr2": "^9.0.5",
 		"npm-run-all": "^4.1.5",

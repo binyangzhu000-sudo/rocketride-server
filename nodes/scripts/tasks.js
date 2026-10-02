@@ -34,13 +34,22 @@ const os = require('os');
 const {
     exists,
     syncDir,
+    syncFile,
+    readDirSafe,
+    readJson,
     formatSyncStats,
     removeDir,
-    PROJECT_ROOT, DIST_ROOT,
+    getSharedName,
+    getSymName,
+    PROJECT_ROOT, BUILD_ROOT, DIST_ROOT,
     startServer,
     stopServer,
     execCommand,
     runPytest,
+    splitPytestOpts,
+    withoutXdistArgs,
+    hasDistMode,
+    collectPytestReport,
     parallel,
     bracket,
     parseServerAddress
@@ -51,8 +60,14 @@ const SRC_DIR = path.join(PACKAGE_DIR, 'src', 'nodes');
 const TEST_DIR = path.join(PACKAGE_DIR, 'test');
 const DIST_DIR = path.join(DIST_ROOT, 'server', 'nodes');
 
+// Build inputs of the c++ and java nodes, not copied into dist
+const IGNORE = ['**/CMakeLists.txt', '**/src/**', '**/lib/**', '**/scripts/**', '**/target/**'];
+
 // Engine (built by server:build; execCommand resolves extension on Windows)
 const ENGINE = path.join(DIST_ROOT, 'server', 'engine');
+
+// Where cmake leaves the c++ node binaries
+const BUILD_NODES_DIR = path.join(BUILD_ROOT, 'nodes');
 
 // ============================================================================
 // Action Factories
@@ -64,18 +79,60 @@ function makeSyncNodesAction(options = {}) {
             task.output = 'Scanning for changes...';
 
             const stats = {};
-            await syncDir(SRC_DIR, DIST_DIR, { mirror: false, package: true }, stats);
+            await syncDir(SRC_DIR, DIST_DIR, { mirror: false, package: true, ignore: IGNORE }, stats);
 
             if (options.overlayRoot) {
                 const overlaySrcDir = path.join(options.overlayRoot, 'nodes', 'src', 'nodes');
                 if (await exists(overlaySrcDir)) {
-                    await syncDir(overlaySrcDir, DIST_DIR, { mirror: false, package: true }, stats);
+                    await syncDir(overlaySrcDir, DIST_DIR, { mirror: false, package: true, ignore: IGNORE }, stats);
                 }
             }
+
+            await syncNodeBinaries(stats);
 
             task.output = formatSyncStats(stats);
         }
     };
+}
+
+// A node folder builds exactly one library, which its services*.json name in
+// their "path". Several services may share it, so they are read as a group
+async function nodeLibrary(nodeDir) {
+    const srcDir = path.join(SRC_DIR, nodeDir);
+    const libs = new Set();
+
+    for (const file of await readDirSafe(srcDir)) {
+        if (!/^services.*\.json$/.test(file)) continue;
+
+        const services = await readJson(path.join(srcDir, file));
+        if (services.node !== 'cpp') continue;
+
+        if (typeof services.path !== 'string' || !services.path)
+            throw new Error(`${path.join(srcDir, file)}: `
+                            + 'a cpp service needs a library name in "path"');
+
+        libs.add(services.path);
+    }
+
+    if (libs.size > 1)
+        throw new Error(`The node ${nodeDir} names more than one library: `
+                        + [...libs].join(', '));
+
+    const [lib] = libs;
+    return lib ?? null;
+}
+
+async function syncNodeBinaries(stats) {
+    for (const nodeDir of await readDirSafe(BUILD_NODES_DIR)) {
+        const lib = await nodeLibrary(nodeDir);
+        if (!lib) continue;
+
+        for (const name of [getSharedName(lib), getSymName(lib)].filter(Boolean)) {
+            await syncFile(path.join(BUILD_NODES_DIR, nodeDir, name),
+                           path.join(DIST_DIR, nodeDir, name),
+                           { package: true }, stats);
+        }
+    }
 }
 
 function makeStartTestServerAction(options = {}) {
@@ -134,24 +191,37 @@ function makeStopTestServerAction() {
     };
 }
 
+// Modes: 'run' (the tests), 'warmup' (download the models of the selected heavy
+// tests; options.warmup === 'plan' only lists them), 'list-skipped' (report the
+// selected tests that will be skipped). Only 'run' needs the test server.
 function makeRunPytestAction(options = {}) {
+    const mode = options.mode || 'run';
     return {
         run: async (ctx, task) => {
             // Load .env for test configuration
             require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env') });
 
-            const bracket = ctx.brackets?.['node-test-server'];
-            if (!bracket?.port) throw new Error('node-test-server bracket missing — server did not start');
-            const serverUri = bracket.serverUri || `http://localhost:${bracket.port}`;
-
             const testEnv = {
                 ...process.env,
-                ROCKETRIDE_URI: serverUri,
                 ROCKETRIDE_MOCK: path.join(PACKAGE_DIR, 'test', 'mocks')
             };
+            if (mode === 'run') {
+                const bracket = ctx.brackets?.['node-test-server'];
+                if (!bracket?.port) throw new Error('node-test-server bracket missing — server did not start');
+                testEnv.ROCKETRIDE_URI = bracket.serverUri || `http://localhost:${bracket.port}`;
+            } else if (options.taskserver) {
+                // The hardware gate needs to know the tests would run on another machine.
+                testEnv.ROCKETRIDE_URI = parseServerAddress(options.taskserver).uri;
+            }
 
             // Use absolute paths since cwd is dist/server
             const extraArgs = ['-v', '--rootdir', PACKAGE_DIR];
+
+            // Warmup only concerns the dynamic tests; collecting just those keeps it quick.
+            const testsDir = mode === 'warmup' ? path.join(TEST_DIR, 'test_dynamic_full.py') : TEST_DIR;
+            if (mode === 'warmup') {
+                extraArgs.unshift(path.join(TEST_DIR, 'test_dynamic.py'));
+            }
 
             if (!options.test_full) {
                 extraArgs.push(
@@ -160,33 +230,16 @@ function makeRunPytestAction(options = {}) {
             }
 
             // Exclude skip_node tests by default (same as skip_nodes in pytest_generate_tests for dynamic tests)
-            const pytestOpts = options.pytest;
-            const markersOpt = options.markers;
-            const hasExplicitMarkers = (() => {
-                if (markersOpt) return true;
-                if (!pytestOpts) return false;
-                const tokens = typeof pytestOpts === 'string'
-                    ? pytestOpts.split(/\s+/).filter(Boolean)
-                    : pytestOpts.flatMap(o => String(o).split(/\s+/).filter(Boolean));
-                return tokens.some(t => t === '-m' || (t.startsWith('-m') && !t.startsWith('--')));
-            })();
+            const pytestTokens = splitPytestOpts(options.pytest);
+            const hasExplicitMarkers = !!options.markers
+                || pytestTokens.some(t => t === '-m' || (t.startsWith('-m') && !t.startsWith('--')));
             if (!hasExplicitMarkers) {
                 extraArgs.push('-m', 'not skip_node');
             }
 
-            // Add any additional pytest options (from CLI or direct options)
-            // options comes from CLI args like --pytest="-s -v"
-            if (pytestOpts) {
-                // Handle both string and array formats
-                // CLI passes array like ["-v -s"], so split each element by spaces
-                if (typeof pytestOpts === 'string') {
-                    extraArgs.push(...pytestOpts.split(/\s+/).filter(x => x));
-                } else if (Array.isArray(pytestOpts)) {
-                    for (const opt of pytestOpts) {
-                        extraArgs.push(...opt.split(/\s+/).filter(x => x));
-                    }
-                }
-            }
+            // Additional pytest options from --pytest="-s -v"; the collect-only
+            // modes run in one process, so xdist options are dropped for them.
+            extraArgs.push(...(mode === 'run' ? pytestTokens : withoutXdistArgs(pytestTokens)));
 
             // Allow filtering tests by marker or pattern
             const markers = options.markers;
@@ -198,31 +251,45 @@ function makeRunPytestAction(options = {}) {
                 extraArgs.push('-k', pattern);
             }
 
-            // Parallel execution via pytest-xdist. Defaults to min(cpus, 8) when the
-            // flag is not set: empirically, cloud-LLM rate limits + node-subprocess
-            // fan-out make >8 workers counterproductive on this test shape. Explicit
-            // values (numeric or 'auto') pass through; 'off'/'0' disables xdist.
-            const parallelRaw = options.pytestParallel ?? String(Math.min(os.cpus().length, 8));
-            const parallelVal = String(parallelRaw).trim().toLowerCase();
-            if (parallelVal && parallelVal !== 'off' && parallelVal !== '0') {
-                extraArgs.push('-n', parallelVal);
-                // Honor @pytest.mark.xdist_group (set in conftest._build_parametrize_list):
-                // same-group tests run on one worker, so heavy GPU/model node tests serialize
-                // and don't OOM-crash workers. The marker is ignored under the default
-                // --dist load. Skip if the caller already chose a distribution mode via
-                // --pytest, in either `--dist <mode>` or `--dist=<mode>` form.
-                const hasDistOverride = extraArgs.some((a) => a === '--dist' || a.startsWith('--dist='));
-                if (!hasDistOverride) {
-                    extraArgs.push('--dist', 'loadgroup');
+            if (mode === 'warmup') {
+                extraArgs.push(`--warmup-models=${options.warmup === 'plan' ? 'plan' : 'download'}`);
+            } else if (mode === 'list-skipped') {
+                extraArgs.push(`--list-skipped=${options.listSkipped}`);
+            } else {
+                // Parallel execution via pytest-xdist. Defaults to min(cpus, 8) when the
+                // flag is not set: empirically, cloud-LLM rate limits + node-subprocess
+                // fan-out make >8 workers counterproductive on this test shape. Explicit
+                // values (numeric or 'auto') pass through; 'off'/'0' disables xdist.
+                const parallelRaw = options.pytestParallel ?? String(Math.min(os.cpus().length, 8));
+                const parallelVal = String(parallelRaw).trim().toLowerCase();
+                if (parallelVal && parallelVal !== 'off' && parallelVal !== '0') {
+                    extraArgs.push('-n', parallelVal);
+                    // Honor @pytest.mark.xdist_group (set in conftest._params): heavy
+                    // tests (requiresHardware) share lanes, each lane on one worker, so
+                    // they don't OOM-crash workers. The marker is ignored under other
+                    // --dist modes, which conftest refuses when heavy tests are selected.
+                    // Skip if the caller already chose a distribution mode via --pytest.
+                    if (!hasDistMode(extraArgs)) {
+                        extraArgs.push('--dist', 'loadgroup');
+                    }
                 }
             }
 
-            await runPytest({
+            const pytest = (extra = []) => runPytest({
                 engine: ENGINE,
-                testsDir: TEST_DIR,
-                extraArgs,
+                testsDir,
+                extraArgs: [...extraArgs, ...extra],
                 execOpts: { task, cwd: PACKAGE_DIR, env: testEnv },
             });
+
+            // Reports the user asked for are printed once the builder finishes.
+            if (mode === 'list-skipped' || (mode === 'warmup' && options.warmup === 'plan')) {
+                await collectPytestReport(ctx, (reportArg) => pytest([reportArg]));
+                return;
+            }
+            await pytest();
+
+            if (mode !== 'run') return;
 
             // The node README schema validator's own tests live at the repo
             // root; they are part of the node contract, so they run here.
@@ -272,31 +339,61 @@ function makeRunContractTestsAction() {
     };
 }
 
-function makeTestAction(options = {}) {
+// Installs nodes/test/requirements.txt: the test harness plus the node packages
+// the tests import directly, which the nodes themselves install only when a
+// pipeline first loads them. depends() applies the engine constraints.
+function makeInstallTestDepsAction() {
     return {
-        description: 'Testing nodes',
-        steps: [
-            'server:build',
-            parallel([
-                'nodes:build',
-                'ai:build',
-                'client-python:build'
-            ], 'Build dependencies'),
-            bracket({
-                name: 'node-test-server',
-                setup: makeStartTestServerAction(options),
-                teardown: makeStopTestServerAction(options),
-                steps: [
-                    {
-                        name: options.test_full 
-                            ? 'nodes:run-pytest-full'
-                            : 'nodes:run-pytest',
-                        action: makeRunPytestAction(options)
-                    }
-                ]
-            })
-        ]
+        run: async (ctx, task) => {
+            task.output = 'Installing node test dependencies...';
+            await execCommand(
+                ENGINE,
+                ['-c', 'import sys; from depends import depends; depends(sys.argv[1])', path.join(TEST_DIR, 'requirements.txt')],
+                { task, cwd: PACKAGE_DIR }
+            );
+        }
+    };
+}
+
+function makeTestAction(options = {}) {
+    if (options.warmup && !['plan', 'off'].includes(options.warmup)) {
+        throw new Error(`--warmup=${options.warmup}: expected 'plan' or 'off'`);
     }
+    const runName = options.test_full ? 'nodes:run-pytest-full' : 'nodes:run-pytest';
+    const steps = [
+        'server:build',
+        parallel([
+            'nodes:build',
+            'ai:build',
+            'client-python:build'
+        ], 'Build dependencies'),
+    ];
+
+    // Collect-only modes need no test server.
+    if (options.listSkipped) {
+        steps.push({ name: `${runName}:list-skipped`, action: makeRunPytestAction({ ...options, mode: 'list-skipped' }) });
+        return { description: 'Listing skipped node tests', steps };
+    }
+    if (options.test_full && options.warmup === 'plan') {
+        steps.push({ name: 'nodes:warmup-models', action: makeRunPytestAction({ ...options, mode: 'warmup' }) });
+        return { description: 'Planning node test model downloads', steps };
+    }
+
+    // The collect-only modes above report the environment as it is; test runs complete it.
+    steps.push({ name: 'nodes:install-test-deps', action: makeInstallTestDepsAction() });
+
+    // Download the selected heavy tests' models before the server starts, so the
+    // downloads don't count against test timeouts. Pointless for a remote server.
+    if (options.test_full && options.warmup !== 'off' && !options.taskserver) {
+        steps.push({ name: 'nodes:warmup-models', action: makeRunPytestAction({ ...options, mode: 'warmup' }) });
+    }
+    steps.push(bracket({
+        name: 'node-test-server',
+        setup: makeStartTestServerAction(options),
+        teardown: makeStopTestServerAction(options),
+        steps: [{ name: runName, action: makeRunPytestAction(options) }]
+    }));
+    return { description: 'Testing nodes', steps };
 }
 
 // ============================================================================

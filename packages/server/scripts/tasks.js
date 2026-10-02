@@ -30,7 +30,7 @@
 const path = require('path');
 const os = require('os');
 const { glob } = require('glob');
-const { getState, setState, updateState, removeDirs, syncDir, syncFile, removeFiles, formatSyncStats, execCommand, runPytest, PROJECT_ROOT, BUILD_ROOT, DIST_ROOT, isWindows, isMac, isLinux, exists, readFile, readJson, writeJson, mkdir, copyFile, removeFile, loadPackageJson, downloadGitHubFile, createArchive, extractArchive, parallel, sequence, whenNot, fingerprint, contentHash, taskDebug, STATE_FILE } = require('../../../scripts/lib');
+const { getState, setState, updateState, removeDirs, removeMatching, syncDir, syncFile, removeFiles, formatSyncStats, execCommand, runPytest, PROJECT_ROOT, BUILD_ROOT, DIST_ROOT, isWindows, isMac, isLinux, getExecName, getSharedName, getSymName, exists, readFile, readJson, writeJson, mkdir, copyFile, removeFile, loadPackageJson, downloadGitHubFile, createArchive, extractArchive, parallel, sequence, whenNot, fingerprint, contentHash, taskDebug, STATE_FILE } = require('../../../scripts/lib');
 const { runCompilerSetup } = require('../../../scripts/compiler');
 
 // Paths
@@ -92,9 +92,12 @@ async function getPackageInfo(options = {}) {
 // State Management
 // =============================================================================
 
-async function isConfigured() {
+async function isConfigured(cmakeConfig) {
 	const configured = await getState('server.configured');
 	if (configured !== true) return false;
+
+	// Check whether CMAKE_BUILD_TYPE has been changed
+	if (cmakeConfig && (await getState('server.buildType')) !== cmakeConfig) return false;
 
 	// Check CMakeCache.txt exists
 	const cmakeCache = path.join(BUILD_ROOT, 'CMakeCache.txt');
@@ -683,7 +686,8 @@ function makeConfigureServerAction(options = {}) {
 	return {
 		locks: ['cmake'],
 		run: async (ctx, task) => {
-			if (!options.force && (await isConfigured())) {
+			const cmakeConfig = options.cmakeConfig || 'Release';
+			if (!options.force && (await isConfigured(cmakeConfig))) {
 				task.output = 'Already configured';
 				return;
 			}
@@ -704,7 +708,7 @@ function makeConfigureServerAction(options = {}) {
 			const overlayPorts = path.join(SERVER_DIR, 'cmake', 'ports');
 			const overlayTriplets = path.join(SERVER_DIR, 'cmake', 'triplets');
 
-			const cmakeArgs = ['cmake', '-B', BUILD_ROOT, '-S', SERVER_DIR, ...generator, '-DCMAKE_BUILD_TYPE=Release', `-DCMAKE_TOOLCHAIN_FILE=${vcpkgToolchain}`, `-DVCPKG_TARGET_TRIPLET=${triplet}`, `-DVCPKG_HOST_TRIPLET=${triplet}`, `-DVCPKG_OVERLAY_PORTS=${overlayPorts}`, `-DVCPKG_OVERLAY_TRIPLETS=${overlayTriplets}`];
+			const cmakeArgs = ['cmake', '-B', BUILD_ROOT, '-S', SERVER_DIR, ...generator, `-DCMAKE_BUILD_TYPE=${cmakeConfig}`, `-DCMAKE_TOOLCHAIN_FILE=${vcpkgToolchain}`, `-DVCPKG_TARGET_TRIPLET=${triplet}`, `-DVCPKG_HOST_TRIPLET=${triplet}`, `-DVCPKG_OVERLAY_PORTS=${overlayPorts}`, `-DVCPKG_OVERLAY_TRIPLETS=${overlayTriplets}`];
 
 			// Opt-in (CI / small-disk hosts): drop each port's buildtree + package
 			// staging right after it builds so peak disk stays low across the whole
@@ -741,7 +745,7 @@ function makeConfigureServerAction(options = {}) {
 			await updateServerState({
 				configured: true,
 				configuredAt: new Date().toISOString(),
-				buildType: 'Release',
+				buildType: cmakeConfig,
 			});
 		},
 	};
@@ -868,17 +872,18 @@ function makeCompileEngineAction(options = {}) {
 			}
 
 			const jobs = getParallelJobs();
-			const cmakeArgs = ['cmake', '--build', BUILD_ROOT, '--config', 'Release', '--target', 'engine', '--parallel', String(jobs)];
+			const cmakeConfig = options.cmakeConfig || 'Release';
+			const cmakeArgs = ['cmake', '--build', BUILD_ROOT, '--config', cmakeConfig, '--target', 'engine', '--parallel', String(jobs)];
 			await execCommand(cmakeArgs[0], cmakeArgs.slice(1), { task, env, verbose: options.verbose });
 
 			// Copy engine to dist
 			await mkdir(DIST_DIR);
 			const engineDir = path.join(BUILD_ROOT, 'engine');
-			const exeExt = isWindows() ? '.exe' : '';
-			await syncFile(path.join(engineDir, 'engine' + exeExt), path.join(DIST_DIR, 'engine' + exeExt), { package: true });
+			const engineName = getExecName('engine');
+			await syncFile(path.join(engineDir, engineName), path.join(DIST_DIR, engineName), { package: true });
 
 			// Copy the shared engine module the executable loads
-			const engineModName = isWindows() ? 'engine.dll' : isMac() ? 'libengine.dylib' : 'libengine.so';
+			const engineModName = getSharedName('engine');
 			const engineModSrc = path.join(BUILD_ROOT, 'engine-mod', engineModName);
 			if (await exists(engineModSrc)) {
 				await syncFile(engineModSrc, path.join(DIST_DIR, engineModName), { package: true });
@@ -887,8 +892,10 @@ function makeCompileEngineAction(options = {}) {
 			}
 
 			if (isWindows()) {
-				await syncFile(path.join(engineDir, 'engine.exe.pdb'), path.join(DIST_DIR, 'engine.exe.pdb'));
-				await syncFile(path.join(BUILD_ROOT, 'engine-mod', 'engine.dll.pdb'), path.join(DIST_DIR, 'engine.dll.pdb'));
+				const engineSym = getSymName(engineName);
+				const engineModSym = getSymName(engineModName);
+				await syncFile(path.join(engineDir, engineSym), path.join(DIST_DIR, engineSym));
+				await syncFile(path.join(BUILD_ROOT, 'engine-mod', engineModSym), path.join(DIST_DIR, engineModSym));
 			} else {
 				// crashpad_handler must ship next to the engine (runtime finds it via
 				// execDir()). Windows keeps its native MiniDumpWriteDump path.
@@ -926,11 +933,18 @@ function makeCompileTestsAction(options = {}) {
 	return {
 		locks: ['cmake'],
 		run: async (ctx, task) => {
+			const cmakeConfig = options.cmakeConfig || 'Release';
+
 			// Check source hash to skip if nothing changed since last test build
 			if (options.force) {
 				task.output = 'Checking for source changes...';
-				const [coreHash, libHash, cmakeHash] = await Promise.all([fingerprint(path.join(SERVER_DIR, 'engine-core')), fingerprint(path.join(SERVER_DIR, 'engine-lib')), fingerprint(path.join(SERVER_DIR, 'cmake'))]);
-				const combinedHash = require('crypto').createHash('md5').update(`${coreHash}:${libHash}:${cmakeHash}`).digest('hex');
+				const [coreHash, libHash, modHash, cmakeHash] = await Promise.all([
+					fingerprint(path.join(SERVER_DIR, 'engine-core')),
+					fingerprint(path.join(SERVER_DIR, 'engine-lib')),
+					fingerprint(path.join(SERVER_DIR, 'engine-mod')),
+					fingerprint(path.join(SERVER_DIR, 'cmake'))
+				]);
+				const combinedHash = require('crypto').createHash('md5').update(`${coreHash}:${libHash}:${modHash}:${cmakeHash}:${cmakeConfig}`).digest('hex');
 
 				const savedHash = await getState('server.testSrcHash');
 				if (combinedHash === savedHash) {
@@ -950,13 +964,18 @@ function makeCompileTestsAction(options = {}) {
 
 			// Build aptest
 			task.output = 'Building aptest...';
-			const aptestArgs = ['--build', BUILD_ROOT, '--config', 'Release', '--target', 'aptest', '--parallel', String(jobs)];
+			const aptestArgs = ['--build', BUILD_ROOT, '--config', cmakeConfig, '--target', 'aptest', '--parallel', String(jobs)];
 			await execCommand('cmake', aptestArgs, { task, env, verbose: options.verbose });
 
 			// Build engtest
 			task.output = 'Building engtest...';
-			const engtestArgs = ['--build', BUILD_ROOT, '--config', 'Release', '--target', 'engtest', '--parallel', String(jobs)];
+			const engtestArgs = ['--build', BUILD_ROOT, '--config', cmakeConfig, '--target', 'engtest', '--parallel', String(jobs)];
 			await execCommand('cmake', engtestArgs, { task, env, verbose: options.verbose });
+
+			// Build nodetest
+			task.output = 'Building nodetest...';
+			const nodetestArgs = ['--build', BUILD_ROOT, '--config', cmakeConfig, '--target', 'nodetest', '--parallel', String(jobs)];
+			await execCommand('cmake', nodetestArgs, { task, env, verbose: options.verbose });
 
 			// Save test source hash after successful build
 			if (ctx._testSrcHash) {
@@ -1058,22 +1077,27 @@ function makeCopyTestDataAction() {
 				}
 			}
 
-			const exeExt = isWindows() ? '.exe' : '';
+			// A multi-config generator writes into a per-configuration
+			// subdirectory, so each binary is looked for both ways
 			const testExes = [
 				{
-					name: 'aptest',
-					paths: [path.join(BUILD_ROOT, 'engine-core', 'test', 'Release', 'aptest' + exeExt), path.join(BUILD_ROOT, 'engine-core', 'test', 'aptest' + exeExt)],
+					name: getExecName('aptest'),
+					dir: path.join(BUILD_ROOT, 'engine-core', 'test')
 				},
 				{
-					name: 'engtest',
-					paths: [path.join(BUILD_ROOT, 'engine-lib', 'test', 'Release', 'engtest' + exeExt), path.join(BUILD_ROOT, 'engine-lib', 'test', 'engtest' + exeExt)],
+					name: getExecName('engtest'),
+					dir: path.join(BUILD_ROOT, 'engine-lib', 'test')
+				},
+				{
+					name: getExecName('nodetest'),
+					dir: path.join(BUILD_ROOT, 'engine-mod', 'test')
 				},
 			];
 
 			for (const test of testExes) {
-				for (const src of test.paths) {
+				for (const src of [path.join(test.dir, 'Release', test.name), path.join(test.dir, test.name)]) {
 					if (await exists(src)) {
-						await copyFile(src, path.join(DIST_DIR, test.name + exeExt));
+						await copyFile(src, path.join(DIST_DIR, test.name));
 						break;
 					}
 				}
@@ -1085,8 +1109,7 @@ function makeCopyTestDataAction() {
 function makeRunAptestAction(options = {}) {
 	return {
 		run: async (ctx, task) => {
-			const exeExt = isWindows() ? '.exe' : '';
-			const exe = path.join(DIST_DIR, 'aptest' + exeExt);
+			const exe = path.join(DIST_DIR, getExecName('aptest'));
 			const args = [...(options.catch || [])];
 			if (options.trace?.length) {
 				args.push(`--trace=${options.trace.join(',')}`);
@@ -1099,8 +1122,20 @@ function makeRunAptestAction(options = {}) {
 function makeRunEngtestAction(options = {}) {
 	return {
 		run: async (ctx, task) => {
-			const exeExt = isWindows() ? '.exe' : '';
-			const exe = path.join(DIST_DIR, 'engtest' + exeExt);
+			const exe = path.join(DIST_DIR, getExecName('engtest'));
+			const args = [...(options.catch || [])];
+			if (options.trace?.length) {
+				args.push(`--trace=${options.trace.join(',')}`);
+			}
+			await execCommand(exe, args, { task, cwd: DIST_DIR });
+		},
+	};
+}
+
+function makeRunNodetestAction(options = {}) {
+	return {
+		run: async (ctx, task) => {
+			const exe = path.join(DIST_DIR, getExecName('nodetest'));
 			const args = [...(options.catch || [])];
 			if (options.trace?.length) {
 				args.push(`--trace=${options.trace.join(',')}`);
@@ -1117,7 +1152,7 @@ function makeBuildCoreAction() {
 			whenNot({
 				name: 'ready',
 				condition: (ctx) => ctx.serverReady,
-				then: [parallel(['server:setup-tools', 'vcpkg:submodule-build', 'java:setup-jdk', 'java:setup-jre'], 'Setup build tools'), 'server:configure', 'server:compile-engine', parallel(['server:setup-python', 'server:setup-jre'], 'Setup dependencies'), parallel(['server:setup-runtime-libs', 'server:setup-samba'], 'Setup runtime'), 'tika:submodule-build'],
+				then: [parallel(['server:setup-tools', 'vcpkg:submodule-build', 'java:setup-jdk', 'java:setup-jre'], 'Setup build tools'), 'server:configure', 'server:compile-engine', parallel(['server:setup-python', 'server:setup-jre'], 'Setup dependencies'), parallel(['server:setup-runtime-libs', 'server:setup-samba'], 'Setup runtime'), 'java:submodule-build', 'parse:submodule-build'],
 			}),
 		],
 	};
@@ -1170,10 +1205,13 @@ function makeCleanServerAction() {
 			await setState('server', {});
 			await setState('package', null);
 
-			await removeFiles(BUILD_ROOT, ['CMakeCache.txt', 'cmake_install.cmake', 'build.ninja', '.ninja_deps', '.ninja_log', 'compile_commands.json', 'CPackConfig.cmake', 'CPackSourceConfig.cmake', 'CTestTestfile.cmake', 'Makefile', 'CMakePresets.json']);
+			await removeFiles(BUILD_ROOT, ['CMakeCache.txt', 'cmake_install.cmake', 'build.ninja', '.ninja_deps', '.ninja_log', 'compile_commands.json', 'CPackConfig.cmake', 'CPackSourceConfig.cmake', 'CTestTestfile.cmake', 'Makefile', 'CMakePresets.json', 'vc140.pdb']);
+
+			// An interrupted configure leaves CMakeCache.txt.tmp<random> behind
+			await removeMatching(BUILD_ROOT, /^CMakeCache\.txt\.tmp/, { recursive: false });
 
 			// Clean only the server build artifacts; vcpkg state is managed by vcpkg:clean
-			await removeDirs([path.join(BUILD_ROOT, 'CMakeFiles'), path.join(BUILD_ROOT, 'Testing'), path.join(BUILD_ROOT, 'apps'), path.join(BUILD_ROOT, 'engine-core'), path.join(BUILD_ROOT, 'engine-lib'), path.join(BUILD_ROOT, 'packages'), path.join(BUILD_ROOT, '_download_temp'), DIST_ARTIFACTS_DIR, DIST_DIR]);
+			await removeDirs([path.join(BUILD_ROOT, 'CMakeFiles'), path.join(BUILD_ROOT, 'Testing'), path.join(BUILD_ROOT, 'apps'), path.join(BUILD_ROOT, 'engine-core'), path.join(BUILD_ROOT, 'engine-lib'), path.join(BUILD_ROOT, 'engine-mod'), path.join(BUILD_ROOT, 'nodes'), path.join(BUILD_ROOT, 'packages'), path.join(BUILD_ROOT, '_download_temp'), DIST_ARTIFACTS_DIR, DIST_DIR]);
 
 			task.output = 'Cleaned server build';
 		},
@@ -1237,7 +1275,7 @@ function makeTestAction() {
 					parallel(['nodes:build', sequence(['mcp-widgets:build', 'ai:build'], 'ai (with widgets)'), 'client-python:build'], 'Build modules'),
 					'server:compile-tests',
 					'server:copy-test-data',
-					parallel(['tika:submodule-test', 'server:run-aptest', 'server:run-engtest', 'server:run-rocketlib-test'], 'Run tests'),
+					parallel(['java:submodule-test', 'parse:submodule-test', 'server:run-aptest', 'server:run-engtest', 'server:run-nodetest', 'server:run-rocketlib-test'], 'Run tests'),
 				],
 			}),
 		],
@@ -1259,8 +1297,7 @@ function makeRocketlibPythonTestAction(options = {}) {
 	return {
 		run: async (_ctx, task) => {
 			const rocketrideTests = path.join(SERVER_DIR, 'engine-lib', 'rocketlib-python', 'tests');
-			const exeExt = isWindows() ? '.exe' : '';
-			const engine = path.join(DIST_DIR, 'engine' + exeExt);
+			const engine = path.join(DIST_DIR, getExecName('engine'));
 
 			const extraArgs = ['-v'];
 			if (options.pytest) {
@@ -1285,7 +1322,10 @@ function makePackageAction(options = {}) {
 		description: 'Packaging server',
 		run: async (_ctx, _task) => {
 			const { manifestFilename, distFilename, symDistFilename, distFile, symDistFile } = await getPackageInfo(options);
-			const symFilenames = isWindows() ? ['engine.exe.pdb', 'engine.dll.pdb'] : null;
+			const symFilenames = isWindows() ? [
+				getSymName(getExecName('engine')), // engine.exe.pdb
+				getSymName(getSharedName('engine')) // engine.dll.pdb
+			] : null;
 
 			const sourceHash = await getState('server.buildHash');
 			const packageHash = await getState('server.packageHash');
@@ -1338,7 +1378,7 @@ function makePackageAction(options = {}) {
 function makeCleanAction() {
 	return {
 		description: 'Cleaning server (all)',
-		steps: ['server:clean', 'vcpkg:submodule-clean', 'java:submodule-clean', 'tika:submodule-clean'],
+		steps: ['server:clean', 'vcpkg:submodule-clean', 'java:submodule-clean', 'parse:submodule-clean'],
 	};
 }
 
@@ -1367,6 +1407,7 @@ module.exports = {
 		{ name: 'server:copy-test-data', action: makeCopyTestDataAction },
 		{ name: 'server:run-aptest', action: makeRunAptestAction },
 		{ name: 'server:run-engtest', action: makeRunEngtestAction },
+		{ name: 'server:run-nodetest', action: makeRunNodetestAction },
 		{ name: 'server:run-rocketlib-test', action: makeRocketlibPythonTestAction },
 		{ name: 'server:clean-run', action: makeCleanServerAction },
 		{
@@ -1417,8 +1458,7 @@ module.exports = {
 			action: (options = {}) => ({
 				run: async (_ctx, task) => {
 					// Use the pre-built engine binary from the assembled dist directory.
-					const exeExt = isWindows() ? '.exe' : '';
-					const engine = path.join(DIST_DIR, 'engine' + exeExt);
+					const engine = path.join(DIST_DIR, getExecName('engine'));
 
 					// Forward --trace=... and --saas from the CLI to the eaas.py process.
 					const args = ['ai/eaas.py'];
