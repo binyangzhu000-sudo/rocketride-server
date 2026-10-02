@@ -446,58 +446,21 @@ function makeBuildImageAction(options = {}) {
     };
 }
 
-// Nodes whose dependencies must install from the baked cache with no network.
-// Between them: opencv pulled in transitively (mediapipe, img2table), the
-// onnxruntime-gpu / ctranslate2 / av stack, and an override (crewai's mcp cap).
-const OFFLINE_NODES = ['face_detection', 'ocr', 'audio_transcribe', 'agent_crewai'];
-
-// Engine side of the image check: the engine is non-dumpable (needs the dropped
-// capabilities a run has), and depends() accepts the shipped constraints as they
-// are. A hash mismatch means every run recompiles them, against whatever PyPI
-// holds that day, and the cache stops matching what runs install.
-const IMAGE_PROBE = `
-import os
-from depends import _find_requirement_files, _find_override_files, _compute_hash
-assert os.stat('/proc/self/environ').st_uid == 0, 'engine is dumpable'
-stored = open('cache/requirements.hash').read().strip()
-now = _compute_hash(_find_requirement_files() + _find_override_files())
-assert stored == now, f'shipped constraints are stale in a container: {stored} != {now}'
-print('image probe ok')
-`;
-
-// Stage 0 of the container tests: the node image as a run would get it. The
-// runtime itself (a pipeline through the container) comes with its Launcher.
-function makeTestImageAction() {
+// Stage 0 of the container tests: the node image as a run gets it, checked by
+// docker/test-node-image.sh (the release workflow runs the same script before
+// signing). The runtime itself (a pipeline through the container) comes with
+// its Launcher.
+function makeTestImageAction(options = {}) {
     return {
         run: async (ctx, task) => {
             const reason = await containerUnavailable();
             if (reason) return skipLoudly('nodes:test-container', task, reason);
 
             const { node } = await imageNames();
-            const run = (args, script) => execCommand('docker',
-                ['run', '--rm', '--cap-drop', 'ALL', ...args, node, './engine', '-c', script],
-                { task, collect: true });
-
-            const failures = [];
-            task.output = 'Probing the engine in the image...';
-            try {
-                await run([], IMAGE_PROBE);
-            } catch (err) {
-                failures.push(`image probe: ${err.message}`);
-            }
-
-            for (const name of OFFLINE_NODES) {
-                task.output = `Installing ${name} offline from the cache...`;
-                try {
-                    await run(['--network', 'none', '-e', 'UV_OFFLINE=1'],
-                        `from depends import depends; depends('nodes/${name}/requirements.txt')`);
-                } catch (err) {
-                    failures.push(`${name}: ${err.message}`);
-                }
-            }
-
-            if (failures.length) throw new Error(`Node image checks failed:\n  ${failures.join('\n  ')}`);
-            task.output = `${node}: engine probe and ${OFFLINE_NODES.length} offline installs passed`;
+            task.output = `Checking ${node}...`;
+            await execCommand('sh', [path.join(PROJECT_ROOT, 'docker', 'test-node-image.sh'), node],
+                { task, verbose: options.verbose });
+            task.output = `${node}: engine probe and offline installs passed`;
         }
     };
 }
