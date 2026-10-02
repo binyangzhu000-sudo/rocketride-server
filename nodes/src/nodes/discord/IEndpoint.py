@@ -22,8 +22,10 @@
 # =============================================================================
 
 import asyncio
+import time
 import json
 import os
+import re
 import threading
 from typing import Any, Callable, Dict, List, Optional
 
@@ -46,7 +48,37 @@ depends(requirements)
 import discord
 from discord.ext import commands
 
-from .text_utils import chunk_message, guess_media_type, should_process_message
+from .text_utils import (
+    attachment_kind,
+    chunk_message,
+    compose_merged_question,
+    find_marker,
+    fold_binary_answer,
+    fold_text_attachment,
+    format_thread_transcript,
+    guess_media_type,
+    inject_role_mention,
+    is_aimed_at_someone_else,
+    looks_like_error,
+    sanitize_reply,
+    should_process_message,
+    with_thread_context,
+)
+
+# Returned by ``_send_chunk`` in place of a thread when creating the response
+# thread failed: the remaining chunks must keep replying instead of asking
+# Discord for a thread again (and failing) once per chunk.
+_THREAD_FALLBACK = object()
+
+# The only auto-archive durations the Discord API accepts. Anything else is
+# rejected with a 400, which would cost the whole answer, so an unsupported
+# value is dropped and the channel's own default applies instead.
+THREAD_ARCHIVE_DURATIONS = (60, 1440, 4320, 10080)
+
+# A ``no_reply`` reason becomes the capture log's dedupe key, and some reasons
+# are built from an exception message. Clipped here, at the one place every
+# reason passes through, so a runaway string cannot reach the key.
+MAX_NO_REPLY_REASON_CHARS = 200
 
 
 class IEndpoint(IEndpointBase):
@@ -72,12 +104,49 @@ class IEndpoint(IEndpointBase):
     # as annotations only to avoid a mutable list shared across instances.
     _guild_ids: List[str]
     _channel_ids: List[str]
+    _require_mention_channel_ids: List[str]
+    _allowed_bot_ids: List[str]
+    _allowed_mention_role_ids: List[str]
+    _allowed_mention_user_ids: List[str]
     _ignore_bots: bool = True
     _require_mention: bool = False
     _reply_mode: str = 'reply'
     _show_typing: bool = True
     _max_attachment_bytes: int = 26214400
     _send_responses: bool = True
+    _thread_name: str = 'Pipeline Response'
+    _thread_name_max_length: int = 90
+    # 0 = the channel's own default (what discord.py does when none is passed).
+    _thread_auto_archive_minutes: int = 0
+    _number_chunks: bool = False
+    _text_attachment_extensions: List[str]
+    _text_attachment_max_chars: int = 12000
+    _merge_attachments: bool = False
+    _emit_reactions: bool = False
+    _emit_no_reply: bool = False
+    _emit_outbound: bool = False
+    _include_member_metadata: bool = False
+    _backfill_limit: int = 0
+    # Support-bot parity behaviors; all off by default so the node stays generic.
+    _thread_history_limit: int = 0
+    _thread_history_max_chars: int = 6000
+    _escalation_pause: bool = False
+    _escalation_markers: List[str]
+    _team_mention_alias: str = ''
+    _ignore_aimed_at_others: bool = False
+    _ack_emoji: str = ''
+    _feedback_reactions: bool = False
+    _feedback_emojis: List[str]
+    _sanitize_replies: bool = False
+    _non_answer_retries: int = 1
+    # Escalation-pause state for this process: threads gone quiet until the bot
+    # is @mentioned again, and threads whose state was already reconciled with
+    # Discord history. Per-instance (created in _pause_state / _startup).
+    _paused_threads: set
+    _resolved_threads: set
+    # thread id -> [asyncio.Lock, borrowers]; only populated while
+    # ``escalationPause`` is on. Created on demand by _thread_lock.
+    _thread_locks: Dict[str, List[Any]]
     _inflight: set
     _shutdown_event: threading.Event
     # Set to a human-readable message when the Gateway client terminally fails
@@ -133,8 +202,8 @@ class IEndpoint(IEndpointBase):
         self._run()
 
     @staticmethod
-    def _as_str_list(value: Any) -> List[str]:
-        """Coerce a config value into a list of string ids.
+    def _as_str_list(value: Any, split: bool = True) -> List[str]:
+        """Coerce a config value into a list of strings.
 
         Guards against a bare string (which would otherwise iterate into a
         per-character allowlist and silently block every real id) and other
@@ -142,17 +211,93 @@ class IEndpoint(IEndpointBase):
 
         Args:
             value (Any): The raw config value (expected: list of ids).
+            split (bool): Split a bare (non-JSON) string on commas and
+                whitespace. Right for ids and extensions; wrong for phrases
+                such as escalation markers, which pass ``split=False`` so
+                "Escalated to the RocketRide team." stays one marker.
 
         Returns:
-            List[str]: The ids as strings, or an empty list.
+            List[str]: The strings, or an empty list.
         """
         if not value:
             return []
-        if isinstance(value, str):
-            return [value]
-        if isinstance(value, (list, tuple)):
-            return [str(v) for v in value]
-        return [str(value)]
+        items = list(value) if isinstance(value, (list, tuple)) else [value]
+        out: List[str] = []
+        for item in items:
+            if item is None:
+                continue
+            if isinstance(item, (int, float)) and not isinstance(item, bool):
+                out.append(str(item))
+                continue
+            # Engine-provided values may be string-like proxies rather than str:
+            # always go through str() before inspecting the text.
+            text = str(item).strip()
+            if not text:
+                continue
+            # The engine delivers array-typed parameters to Python nodes as JSON
+            # text, either bare ('["123","456"]') or as the only element of a
+            # list (['["123","456"]']). Treating that text as one id made every
+            # allowlist reject every message. Parse it back, and also accept a
+            # comma/whitespace-separated list a user may type by hand.
+            if text.startswith('['):
+                try:
+                    parsed = json.loads(text)
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    out.extend(str(v) for v in parsed if str(v).strip())
+                    continue
+            if split:
+                out.extend(part for part in re.split(r'[,\s]+', text) if part)
+            else:
+                out.append(text)
+        return out
+
+    @staticmethod
+    def _as_int(value: Any, default: int) -> int:
+        """Coerce a numeric config value to ``int``, falling back to ``default``.
+
+        The engine delivers ``number`` parameters to Python nodes as
+        string-like proxies rather than ints, and these values are used where
+        only a real int works (slice bounds, size comparisons, a Discord API
+        argument). Goes through ``float`` so ``'12.0'`` is accepted too.
+
+        Args:
+            value (Any): The raw config value.
+            default (int): Used when the value is missing or unusable.
+
+        Returns:
+            int: The coerced value, or ``default``.
+        """
+        try:
+            return int(float(str(value)))
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _snowflake_ids(cls, value: Any, field: str) -> List[str]:
+        """Coerce an id allowlist, keeping only ids Discord could have issued.
+
+        ``_allowed_mentions`` turns every entry into ``int(...)``, and that
+        call sits inside the per-chunk send: one non-numeric entry (a role
+        name, a pasted ``<@&123>``) raised for every chunk of every answer, so
+        a single typo silenced the bot completely. Bad entries are dropped
+        with a debug line instead.
+
+        Args:
+            value (Any): The raw config value.
+            field (str): Field name, for the debug line.
+
+        Returns:
+            List[str]: The digit-only ids, in configured order.
+        """
+        ids: List[str] = []
+        for item in cls._as_str_list(value):
+            if item.isdigit():
+                ids.append(item)
+            else:
+                debug(f'Discord: ignoring {field} entry {item!r} - not a numeric Discord id')
+        return ids
 
     def _run(self):
         """Register on the shared WebServer from ``node.py`` and block on shutdown.
@@ -175,12 +320,57 @@ class IEndpoint(IEndpointBase):
         self._bot_token = config.get('botToken', '')
         self._guild_ids = self._as_str_list(config.get('guildIds'))
         self._channel_ids = self._as_str_list(config.get('channelIds'))
+        self._require_mention_channel_ids = self._as_str_list(config.get('requireMentionChannelIds'))
+        self._allowed_bot_ids = self._as_str_list(config.get('allowedBotIds'))
+        # Mention allowlists are the one config the outbound path cannot
+        # tolerate garbage in, so a non-numeric entry is dropped here.
+        self._allowed_mention_role_ids = self._snowflake_ids(
+            config.get('allowedMentionRoleIds'), 'allowedMentionRoleIds'
+        )
+        self._allowed_mention_user_ids = self._snowflake_ids(
+            config.get('allowedMentionUserIds'), 'allowedMentionUserIds'
+        )
         self._ignore_bots = config.get('ignoreBots', True)
         self._require_mention = config.get('requireMention', False)
-        self._reply_mode = config.get('replyMode', 'reply')
+        # Engine-provided strings may be proxies; this one is compared to
+        # literals and the numbers below are used where only an int works.
+        self._reply_mode = str(config.get('replyMode') or 'reply')
         self._show_typing = config.get('showTyping', True)
-        self._max_attachment_bytes = config.get('maxAttachmentBytes', 26214400)
+        self._max_attachment_bytes = self._as_int(config.get('maxAttachmentBytes'), 26214400)
         self._send_responses = config.get('sendResponses', True)
+        self._thread_name = str(config.get('threadName') or 'Pipeline Response')
+        self._thread_name_max_length = self._as_int(config.get('threadNameMaxLength'), 90)
+        self._thread_auto_archive_minutes = self._as_int(config.get('threadAutoArchiveMinutes'), 0)
+        self._number_chunks = config.get('numberChunks', False)
+        self._text_attachment_extensions = [
+            value.lower() for value in self._as_str_list(config.get('textAttachmentExtensions', []))
+        ]
+        self._text_attachment_max_chars = self._as_int(config.get('textAttachmentMaxChars'), 12000)
+        self._merge_attachments = config.get('mergeAttachments', False)
+        self._emit_reactions = config.get('emitReactions', False)
+        self._emit_no_reply = config.get('emitNoReply', False)
+        self._emit_outbound = config.get('emitOutbound', False)
+        self._include_member_metadata = config.get('includeMemberMetadata', False)
+        self._backfill_limit = self._as_int(config.get('backfillLimit'), 0)
+        self._thread_history_limit = self._as_int(config.get('threadHistoryLimit'), 0)
+        self._thread_history_max_chars = self._as_int(config.get('threadHistoryMaxChars'), 6000)
+        self._escalation_pause = config.get('escalationPause', False)
+        self._escalation_markers = self._as_str_list(config.get('escalationMarkers'), split=False)
+        # Engine-provided strings may be proxies; this one becomes a regex.
+        self._team_mention_alias = str(config.get('teamMentionAlias', '') or '')
+        self._ignore_aimed_at_others = config.get('ignoreAimedAtOthers', False)
+        # Engine-provided strings may be proxies; discord.py needs a real str.
+        self._ack_emoji = str(config.get('ackEmoji', '') or '')
+        self._feedback_reactions = config.get('feedbackReactions', False)
+        self._feedback_emojis = self._as_str_list(config.get('feedbackEmojis', ['✅', '❌']), split=False)
+        self._sanitize_replies = config.get('sanitizeReplies', False)
+        # Clamped to the schema's 0..3; a malformed value falls back to the default.
+        try:
+            self._non_answer_retries = max(0, min(3, int(config.get('nonAnswerRetries', 1))))
+        except (TypeError, ValueError):
+            self._non_answer_retries = 1
+        self._paused_threads = set()
+        self._resolved_threads = set()
         debug(f'Discord _run: token_present={bool(self._bot_token)} reply_mode={self._reply_mode!r}')
 
         # Discover the shared server lazily — node.py assigns its module-level
@@ -241,6 +431,8 @@ class IEndpoint(IEndpointBase):
         self._inflight = set()
         self._fatal_error = None
         self._closing = False
+        self._backfill_done = False
+        self._pause_state()
 
         if not self._bot_token:
             # Fail fast: a source with no token can never receive messages, so
@@ -251,6 +443,10 @@ class IEndpoint(IEndpointBase):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
+        if self._include_member_metadata and hasattr(intents, 'members'):
+            intents.members = True
+        if self._emit_reactions and hasattr(intents, 'reactions'):
+            intents.reactions = True
 
         self._bot = commands.Bot(command_prefix='!', intents=intents)
 
@@ -264,10 +460,23 @@ class IEndpoint(IEndpointBase):
             }
             monitorOther('usr', json.dumps([info]))
             monitorStatus(f'Discord Bot ready - logged in as {self._bot.user}')
+            if self._backfill_limit > 0 and not getattr(self, '_backfill_done', False):
+                self._backfill_done = True
+                await self._run_backfill()
 
         @self._bot.event
         async def on_message(message: discord.Message):
             await self._on_message(message)
+
+        if self._emit_reactions:
+
+            @self._bot.event
+            async def on_raw_reaction_add(payload):
+                await self._on_raw_reaction(payload, True)
+
+            @self._bot.event
+            async def on_raw_reaction_remove(payload):
+                await self._on_raw_reaction(payload, False)
 
         self._bot_task = asyncio.create_task(self._bot_runner())
         monitorStatus('Discord Bot: connecting to Gateway...')
@@ -291,7 +500,10 @@ class IEndpoint(IEndpointBase):
         except discord.LoginFailure:
             self._fail('Discord Bot: login failed (invalid token)')
         except discord.PrivilegedIntentsRequired:
-            self._fail('Discord Bot: enable the Message Content Intent in the Developer Portal')
+            intents = ['Message Content']
+            if getattr(self, '_include_member_metadata', False):
+                intents.append('Server Members')
+            self._fail(f'Discord Bot: enable the {" and ".join(intents)} Intent in the Developer Portal')
         except Exception as e:
             debug(f'Discord _bot_runner: EXCEPTION {e}')
             self._fail(f'Discord Bot: gateway error - {e}')
@@ -352,7 +564,7 @@ class IEndpoint(IEndpointBase):
     # Message handling
     # -------------------------------------------------------------------------
 
-    async def _on_message(self, message: discord.Message):
+    async def _on_message(self, message: discord.Message, wait: bool = False):
         """Filter an incoming message and dispatch it for processing.
 
         Applies bot-loop prevention, the guild/channel allowlists, and the
@@ -366,7 +578,28 @@ class IEndpoint(IEndpointBase):
             None
         """
         try:
+            # Discord's own notices (joins, pins, boosts, "started a thread")
+            # are not questions, and a message with neither text nor a file has
+            # nothing to ask about. ``is_system`` must be a real bool: a
+            # stand-in returning anything else is not a system flag.
+            is_system = getattr(message, 'is_system', None)
+            if callable(is_system) and is_system() is True:
+                return
+            content = getattr(message, 'content', '') or ''
+            if isinstance(content, str):
+                content = content.strip()
+            if not content and not (getattr(message, 'attachments', None) or []):
+                return
+
             bot_user = self._bot.user
+            parent_channel_id = (
+                getattr(message.channel, 'parent_id', None) if isinstance(message.channel, discord.Thread) else None
+            )
+            require_mention_channels = getattr(self, '_require_mention_channel_ids', [])
+            require_mention = self._require_mention or (
+                str(message.channel.id) in require_mention_channels
+                or str(parent_channel_id) in require_mention_channels
+            )
             if not should_process_message(
                 author_id=message.author.id,
                 bot_user_id=bot_user.id if bot_user is not None else None,
@@ -374,30 +607,72 @@ class IEndpoint(IEndpointBase):
                 ignore_bots=self._ignore_bots,
                 guild_id=message.guild.id if message.guild is not None else None,
                 channel_id=message.channel.id,
+                parent_channel_id=parent_channel_id,
                 allowed_guild_ids=self._guild_ids,
                 allowed_channel_ids=self._channel_ids,
-                require_mention=self._require_mention,
+                allowed_bot_ids=getattr(self, '_allowed_bot_ids', []),
+                require_mention=require_mention,
                 # Direct @mention only: `mentioned_in` also returns True for
                 # @everyone/@here, which would defeat the require_mention gate.
                 is_mentioned=bool(bot_user is not None and bot_user in message.mentions),
             ):
                 return
 
-            task = asyncio.create_task(self._process_message(message))
+            task = asyncio.create_task(self._process_serialized(message))
             self._inflight.add(task)
             task.add_done_callback(self._inflight.discard)
+            if wait:
+                await task
         except Exception as e:
             debug(f'Discord _on_message: EXCEPTION {e}')
 
-    async def _process_message(self, message: discord.Message):
-        """Route a message to the pipeline and send back the first answer.
+    def _thread_lock(self, thread_id: str) -> asyncio.Lock:
+        """Borrow the serialization lock for one thread, creating it on demand.
 
-        Text content and attachments are ingested independently: the text is
-        routed to the text lane, and every attachment is downloaded (subject to
-        the size cap) and routed to the image/audio/video/tags lane by MIME
-        type. All attachments are ingested (a message may carry up to 10); only
-        the first non-empty answer overall — text first, then attachments in
-        order — is sent back per the configured reply mode.
+        Each entry is ``[lock, holders]``; the count is what lets the lock be
+        dropped exactly when nothing holds or waits on it (``Lock.locked()``
+        is already False while a waiter is still being woken, so it cannot
+        answer that on its own).
+
+        Args:
+            thread_id (str): The thread the caller is about to process in.
+
+        Returns:
+            asyncio.Lock: The lock to hold; release it with
+                :meth:`_release_thread_lock`.
+        """
+        locks = getattr(self, '_thread_locks', None)
+        if locks is None:
+            locks = self._thread_locks = {}
+        entry = locks.get(thread_id)
+        if entry is None:
+            entry = locks[thread_id] = [asyncio.Lock(), 0]
+        entry[1] += 1
+        return entry[0]
+
+    def _release_thread_lock(self, thread_id: str):
+        """Give back a borrowed lock, forgetting the thread once it is idle."""
+        locks = getattr(self, '_thread_locks', None) or {}
+        entry = locks.get(thread_id)
+        if entry is None:
+            return
+        entry[1] -= 1
+        if entry[1] <= 0:
+            locks.pop(thread_id, None)
+
+    async def _process_serialized(self, message: discord.Message):
+        """Process one message, one at a time per thread when the pause is on.
+
+        ``escalationPause`` pauses a thread only once the escalating answer has
+        been posted. A follow-up that arrived while that answer was still being
+        produced therefore checked a pause that did not exist yet and was
+        answered as well — exactly the second answer the pause exists to
+        prevent. Holding a per-thread lock across the whole handler makes the
+        follow-up see the pause.
+
+        Only threads, and only with ``escalationPause`` on: with it off (the
+        default) nothing is serialized and processing stays as concurrent as it
+        was.
 
         Args:
             message (discord.Message): The message to process.
@@ -405,30 +680,866 @@ class IEndpoint(IEndpointBase):
         Returns:
             None
         """
+        channel = getattr(message, 'channel', None)
+        if not getattr(self, '_escalation_pause', False) or not isinstance(channel, discord.Thread):
+            await self._process_message(message)
+            return
+
+        thread_id = str(channel.id)
+        lock = self._thread_lock(thread_id)
         try:
+            async with lock:
+                await self._process_message(message)
+        finally:
+            self._release_thread_lock(thread_id)
+
+    async def _run_backfill(self):
+        """Process the most recent configured messages, oldest first."""
+        try:
+            channels = []
+            if self._channel_ids:
+                for channel_id in self._channel_ids:
+                    channel = self._bot.get_channel(int(channel_id))
+                    if channel is not None:
+                        channels.append(channel)
+            else:
+                channels = [
+                    channel for channel in self._bot.get_all_channels() if isinstance(channel, discord.TextChannel)
+                ]
+        except Exception as e:
+            debug(f'Discord backfill error: {e}')
+            return
+
+        for channel in channels:
+            # Per channel: one the bot cannot read history in (a missing
+            # permission on a single channel is common) must not silently
+            # cancel the backfill for every channel after it.
+            try:
+                messages = [message async for message in channel.history(limit=self._backfill_limit)]
+                for message in reversed(messages):
+                    await self._on_message(message, wait=True)
+            except Exception as e:
+                debug(f'Discord backfill: skipping channel {getattr(channel, "id", "?")}: {e}')
+
+    def _message_metadata(self, message: discord.Message) -> Dict[str, Any]:
+        """Build the stable downstream metadata contract for one message."""
+        channel = message.channel
+        is_thread = isinstance(channel, discord.Thread)
+        created_at = getattr(message, 'created_at', None)
+        author = message.author
+        reference = getattr(message, 'reference', None)
+        bot_user = getattr(getattr(self, '_bot', None), 'user', None)
+        include_member = getattr(self, '_include_member_metadata', False)
+        roles_value = getattr(author, 'roles', []) if include_member else []
+        roles = roles_value if isinstance(roles_value, (list, tuple)) else []
+        mentions_value = getattr(message, 'mentions', [])
+        mentions = mentions_value if isinstance(mentions_value, (list, tuple)) else []
+        role_mentions_value = getattr(message, 'role_mentions', [])
+        role_mentions = role_mentions_value if isinstance(role_mentions_value, (list, tuple)) else []
+        attachments = []
+        for attachment in getattr(message, 'attachments', []):
+            attachments.append(
+                {
+                    'name': getattr(attachment, 'filename', None),
+                    'contentType': getattr(attachment, 'content_type', None),
+                    'size': getattr(attachment, 'size', None),
+                }
+            )
+        return {
+            'messageId': str(message.id),
+            'channelId': str(channel.id),
+            'threadId': str(channel.id) if is_thread else None,
+            'parentChannelId': (
+                str(channel.parent_id) if is_thread and getattr(channel, 'parent_id', None) is not None else None
+            ),
+            'guildId': str(message.guild.id) if getattr(message, 'guild', None) is not None else None,
+            'createdAt': created_at.isoformat() if created_at is not None else None,
+            'authorId': str(author.id),
+            'authorIsBot': bool(author.bot),
+            'authorDisplayName': getattr(author, 'display_name', None) if include_member else None,
+            'authorRoleIds': [str(role.id) for role in roles],
+            'mentionedUserIds': [str(user.id) for user in mentions],
+            'mentionedRoleIds': [str(role.id) for role in role_mentions] if include_member else [],
+            'repliedToMessageId': (
+                str(reference.message_id) if reference is not None and reference.message_id is not None else None
+            ),
+            'botUserId': str(bot_user.id) if bot_user is not None else None,
+            'attachments': attachments,
+            'correlationId': str(message.id),
+            'groupIndex': 0,
+            'groupSize': 1,
+        }
+
+    def _reactor_is_bot(self, payload, added: bool) -> bool:
+        """Whether the account that reacted is a bot, as far as we can tell.
+
+        ``payload.member`` is only populated on an add (and only in a guild),
+        so a removal is resolved through the user cache instead. An account
+        neither source knows is treated as human: dropping every unknown
+        reactor would quietly lose real feedback.
+
+        Args:
+            payload: The raw reaction payload.
+            added (bool): True for an add, False for a remove.
+
+        Returns:
+            bool: True only when the reactor is known to be a bot.
+        """
+        member = getattr(payload, 'member', None)
+        if added and member is not None:
+            return bool(getattr(member, 'bot', False))
+        bot = getattr(self, '_bot', None)
+        get_user = getattr(bot, 'get_user', None) if bot is not None else None
+        user = get_user(payload.user_id) if callable(get_user) else None
+        return bool(getattr(user, 'bot', False))
+
+    async def _on_raw_reaction(self, payload, added: bool):
+        """Emit one raw reaction event when reaction capture is enabled."""
+        if not getattr(self, '_emit_reactions', False):
+            return
+        bot_user = getattr(getattr(self, '_bot', None), 'user', None)
+        # The node's own feedback reactions (feedbackReactions adds ✅/❌ to every
+        # answer it posts) are affordances, not feedback: emitting them would have
+        # a subscriber count a user grade on every answer before anyone reacted.
+        if bot_user is not None and str(payload.user_id) == str(getattr(bot_user, 'id', None)):
+            return
+        member = getattr(payload, 'member', None)
+        channel = self._bot.get_channel(payload.channel_id) if self._bot is not None else None
+        is_thread = isinstance(channel, discord.Thread)
+
+        # A reaction is scoped exactly like a message: without this the
+        # allowlists and ignoreBots applied to questions but not to the
+        # reaction events the same node emits.
+        allowed_channel_ids = getattr(self, '_channel_ids', []) or []
+        if allowed_channel_ids and channel is None:
+            # The parent of a thread is the only way a thread matches the
+            # allowlist, and an unresolved channel cannot say either way.
+            debug(f'Discord: reaction in unresolved channel {payload.channel_id} dropped by the channel allowlist')
+            return
+        if not should_process_message(
+            author_id=payload.user_id,
+            bot_user_id=getattr(bot_user, 'id', None),
+            author_is_bot=self._reactor_is_bot(payload, added),
+            ignore_bots=getattr(self, '_ignore_bots', True),
+            guild_id=getattr(payload, 'guild_id', None),
+            channel_id=payload.channel_id,
+            parent_channel_id=getattr(channel, 'parent_id', None) if is_thread else None,
+            allowed_guild_ids=getattr(self, '_guild_ids', []) or [],
+            allowed_channel_ids=allowed_channel_ids,
+            allowed_bot_ids=getattr(self, '_allowed_bot_ids', []) or [],
+            # A reaction carries no text, so there is nothing to mention in.
+            require_mention=False,
+            is_mentioned=False,
+        ):
+            return
+
+        metadata = {
+            'messageId': str(payload.message_id),
+            'channelId': str(payload.channel_id),
+            'threadId': str(payload.channel_id) if is_thread else None,
+            'parentChannelId': str(channel.parent_id) if is_thread else None,
+            'guildId': str(payload.guild_id) if getattr(payload, 'guild_id', None) is not None else None,
+            'createdAt': None,
+            'authorId': str(payload.user_id),
+            'authorIsBot': bool(getattr(member, 'bot', False)),
+            'authorDisplayName': getattr(member, 'display_name', None)
+            if getattr(self, '_include_member_metadata', False)
+            else None,
+            'authorRoleIds': [str(role.id) for role in getattr(member, 'roles', [])]
+            if getattr(self, '_include_member_metadata', False) and member is not None
+            else [],
+            'mentionedUserIds': [],
+            'mentionedRoleIds': [],
+            'repliedToMessageId': None,
+            'botUserId': str(bot_user.id) if bot_user is not None else None,
+            'attachments': [],
+            'correlationId': str(payload.message_id),
+            'groupIndex': 0,
+            'groupSize': 1,
+        }
+        await asyncio.to_thread(
+            self._emit_event_pipeline,
+            metadata,
+            'reaction',
+            # occurredAt is stamped once, here, so every consumer of this event — the
+            # broadcast, live capture and a later import from the task log — keys
+            # the same reaction identically.
+            {
+                'emoji': str(payload.emoji),
+                'added': added,
+                'userId': str(payload.user_id),
+                'occurredAt': int(time.time() * 1000),
+            },
+        )
+
+    # -------------------------------------------------------------------------
+    # Support-bot parity behaviors (all opt-in)
+    # -------------------------------------------------------------------------
+
+    def _pause_state(self):
+        """Return the (paused, resolved) thread-id sets, creating them on demand.
+
+        Created lazily so the sets exist however the endpoint was brought up
+        (``_run`` / ``_startup`` in production, direct construction in tests).
+
+        Returns:
+            tuple: ``(paused_thread_ids, resolved_thread_ids)`` as str sets.
+        """
+        if getattr(self, '_paused_threads', None) is None:
+            self._paused_threads = set()
+        if getattr(self, '_resolved_threads', None) is None:
+            self._resolved_threads = set()
+        return self._paused_threads, self._resolved_threads
+
+    def _effective_markers(self) -> List[str]:
+        """The escalation markers that count for pausing and sanitizing.
+
+        The configured ``escalationMarkers`` plus a role mention for every id in
+        ``allowedMentionRoleIds`` — a role the node is allowed to ping is by
+        construction the team it escalates to (the support bot hardcodes exactly
+        one such mention).
+
+        Returns:
+            List[str]: Markers in configured order, role mentions appended.
+        """
+        markers = list(getattr(self, '_escalation_markers', []) or [])
+        for role_id in getattr(self, '_allowed_mention_role_ids', []) or []:
+            marker = f'<@&{role_id}>'
+            if marker not in markers:
+                markers.append(marker)
+        return markers
+
+    def _with_team_mention(self, text: str) -> str:
+        """Turn the configured team alias in an answer into a real role mention.
+
+        Mirrors the support bot's ``injectRoleMention``. The agent is prompted
+        to hand off to a literal team name, which Discord renders as plain text
+        and pings nobody; the first id in ``allowedMentionRoleIds`` is the role
+        the node may actually mention, so that is the one substituted.
+
+        Args:
+            text (str): The pipeline answer.
+
+        Returns:
+            str: The answer, unchanged unless both the alias and an allowed
+                role id are configured.
+        """
+        alias = getattr(self, '_team_mention_alias', '')
+        role_ids = getattr(self, '_allowed_mention_role_ids', []) or []
+        if not text or not alias or not role_ids:
+            return text
+        return inject_role_mention(text, alias, f'<@&{role_ids[0]}>')
+
+    def _is_bot_mentioned(self, message: discord.Message) -> bool:
+        """True when this bot is directly @mentioned (never @everyone/@here)."""
+        bot_user = getattr(getattr(self, '_bot', None), 'user', None)
+        if bot_user is None:
+            return False
+        mentions = getattr(message, 'mentions', []) or []
+        if not isinstance(mentions, (list, tuple)):
+            return False
+        return bot_user in mentions
+
+    async def _paused_from_history(self, thread) -> Optional[bool]:
+        """Reconstruct a thread's escalation pause from its recent history.
+
+        Mirrors the support bot's ``isPausedFromHistory``: walk the last 50
+        messages oldest first; a bot message carrying an escalation marker
+        pauses, a later non-bot message that @mentions the bot resumes. Used the
+        first time this process sees a thread, so a restart does not resume a
+        conversation a human took over.
+
+        Args:
+            thread (discord.Thread): The thread to reconcile.
+
+        Returns:
+            Optional[bool]: True when the thread should be treated as paused,
+                False when it should not, and None when the history could not
+                be read — which is "unknown", not "not paused", so the caller
+                must try again on the next message rather than fixing the
+                thread as open for the rest of the process.
+        """
+        markers = self._effective_markers()
+        if not markers:
+            return False
+        bot_user = getattr(getattr(self, '_bot', None), 'user', None)
+        bot_user_id = getattr(bot_user, 'id', None)
+        try:
+            history = [item async for item in thread.history(limit=50)]
+        except Exception as e:
+            debug(f'Discord: pause-state history fetch failed: {e}')
+            return None
+
+        paused = False
+        for item in reversed(history):  # Discord returns newest first
+            author = getattr(item, 'author', None)
+            if getattr(author, 'id', None) == bot_user_id:
+                if find_marker(getattr(item, 'content', '') or '', markers):
+                    paused = True
+            elif self._is_bot_mentioned(item):
+                paused = False
+        return paused
+
+    async def _thread_transcript(self, message: discord.Message) -> str:
+        """Build the thread transcript handed to the pipeline as context.
+
+        Mirrors the support bot's ``threadTranscript``: up to
+        ``threadHistoryLimit`` prior messages, oldest first, excluding the
+        current message, system messages, and empty content; capped at
+        ``threadHistoryMaxChars``. Best-effort — a failed fetch means no context.
+
+        The fetch is bounded by ``before=message`` so the limit counts
+        ``threadHistoryLimit`` EARLIER messages: fetching the newest N included
+        the message being answered, which left N-1 of context (and none at all
+        at ``threadHistoryLimit=1``).
+
+        Args:
+            message (discord.Message): The message being processed (excluded).
+
+        Returns:
+            str: The transcript, or '' when there is nothing usable.
+        """
+        limit = getattr(self, '_thread_history_limit', 0)
+        if limit <= 0:
+            return ''
+        bot_user = getattr(getattr(self, '_bot', None), 'user', None)
+        bot_user_id = getattr(bot_user, 'id', None)
+        bot_name = getattr(bot_user, 'display_name', None) or getattr(bot_user, 'name', None) or 'assistant'
+        try:
+            history = [item async for item in message.channel.history(limit=limit, before=message)]
+        except Exception as e:
+            debug(f'Discord: thread history fetch failed: {e}')
+            return ''
+
+        entries = []
+        for item in reversed(history):  # Discord returns newest first
+            # ``before`` already excludes it; kept as a harmless guard.
+            if getattr(item, 'id', None) == message.id:
+                continue
+            is_system = getattr(item, 'is_system', None)
+            if callable(is_system) and is_system():
+                continue
+            content = getattr(item, 'content', '') or ''
+            if not content.strip():
+                continue
+            author = getattr(item, 'author', None)
+            if getattr(author, 'id', None) == bot_user_id:
+                name = bot_name
+            else:
+                name = getattr(author, 'name', None) or 'user'
+            entries.append((str(name), str(content)))
+        return format_thread_transcript(entries, getattr(self, '_thread_history_max_chars', 6000))
+
+    async def _aimed_at_someone_else(self, message: discord.Message) -> bool:
+        """Whether this message belongs to someone else's conversation.
+
+        Gathers the plain values the pure predicate needs (mentions, role
+        mentions, reply reference) and fetches the replied-to message only when
+        it can change the answer. The fetch is best-effort.
+
+        Args:
+            message (discord.Message): The incoming message.
+
+        Returns:
+            bool: True when the node should acknowledge instead of answering.
+        """
+        bot_user = getattr(getattr(self, '_bot', None), 'user', None)
+        bot_user_id = getattr(bot_user, 'id', None)
+        is_mentioned = self._is_bot_mentioned(message)
+        reference = getattr(message, 'reference', None)
+        is_reply = reference is not None and getattr(reference, 'message_id', None) is not None
+        mentions = getattr(message, 'mentions', []) or []
+        mentions = mentions if isinstance(mentions, (list, tuple)) else []
+        role_mentions = getattr(message, 'role_mentions', []) or []
+        role_mentions = role_mentions if isinstance(role_mentions, (list, tuple)) else []
+
+        reply_target_is_bot = None
+        if is_reply and not is_mentioned:
+            try:
+                referenced = await message.fetch_reference()
+                author = getattr(referenced, 'author', None)
+                reply_target_is_bot = getattr(author, 'id', None) == bot_user_id
+            except Exception as e:
+                debug(f'Discord: fetch_reference failed: {e}')
+
+        return is_aimed_at_someone_else(
+            is_bot_mentioned=is_mentioned,
+            mentioned_user_ids=[str(user.id) for user in mentions],
+            bot_user_id=str(bot_user_id) if bot_user_id is not None else None,
+            role_mention_count=len(role_mentions),
+            is_reply=is_reply,
+            reply_target_is_bot=reply_target_is_bot,
+        )
+
+    async def _react(self, message: discord.Message, emoji: str) -> bool:
+        """Add one reaction, best-effort (needs the Add Reactions permission)."""
+        try:
+            await message.add_reaction(emoji)
+            return True
+        except Exception as e:
+            debug(f'Discord: reaction {emoji!r} failed (grant "Add Reactions"): {e}')
+            return False
+
+    async def _skip_reason(self, message: discord.Message) -> Optional[str]:
+        """Decide whether to stay quiet on this message, mirroring the bot.
+
+        Two opt-in gates, in the support bot's order: a thread that escalated
+        stays quiet until the bot is @mentioned again, and a message aimed at
+        somebody else gets an acknowledging reaction instead of an answer (and
+        pauses its thread, as the bot does).
+
+        Args:
+            message (discord.Message): The message about to be processed.
+
+        Returns:
+            Optional[str]: A ``no_reply`` reason (``'paused'`` /
+                ``'aimed_elsewhere'``) when the message must not be processed,
+                else None.
+        """
+        channel = message.channel
+        thread_id = str(channel.id) if isinstance(channel, discord.Thread) else None
+        escalation_pause = getattr(self, '_escalation_pause', False)
+
+        if escalation_pause and thread_id is not None:
+            paused, resolved = self._pause_state()
+            is_paused = thread_id in paused
+            reconciled = True
+            if not is_paused and thread_id not in resolved:
+                # First sight of this thread in this process: reconcile with
+                # Discord so a restart does not resume a handed-over thread.
+                from_history = await self._paused_from_history(channel)
+                if from_history is None:
+                    # The fetch failed, so nothing is known either way. Leave
+                    # the thread unreconciled so the next message asks again,
+                    # and answer this one: a transient permission or network
+                    # failure must not freeze a handed-over thread as open.
+                    reconciled = False
+                else:
+                    is_paused = from_history
+                    if is_paused:
+                        paused.add(thread_id)
+                        debug(f'Discord: thread {thread_id} restored as paused from history')
+            if reconciled:
+                resolved.add(thread_id)
+            if is_paused:
+                if not self._is_bot_mentioned(message):
+                    return 'paused'
+                paused.discard(thread_id)  # the user re-engaged the bot
+                debug(f'Discord: thread {thread_id} re-engaged by mention')
+
+        if getattr(self, '_ignore_aimed_at_others', False) and await self._aimed_at_someone_else(message):
+            ack_emoji = getattr(self, '_ack_emoji', '')
+            if ack_emoji:
+                await self._react(message, ack_emoji)
+            if escalation_pause and thread_id is not None:
+                self._pause_state()[0].add(thread_id)
+            return 'aimed_elsewhere'
+
+        return None
+
+    async def _after_send(self, message: discord.Message, reply: str, outbound: Dict[str, Any]):
+        """Apply the post-reply side effects the support bot applies.
+
+        Pauses the thread when the posted answer escalated (it carries an
+        escalation marker), and adds the configured feedback affordances to the
+        last posted chunk. Both are best-effort and never fail the reply.
+
+        Args:
+            message (discord.Message): The originating message.
+            reply (str): The answer that was posted.
+            outbound (Dict[str, Any]): The result of :meth:`_send_response`;
+                mutated with ``feedbackEmojis`` when reactions were applied.
+
+        Returns:
+            None
+        """
+        if not outbound.get('messageIds'):
+            return
+
+        if getattr(self, '_escalation_pause', False) and find_marker(reply, self._effective_markers()):
+            thread_id = outbound.get('threadId')
+            if thread_id is None and isinstance(message.channel, discord.Thread):
+                thread_id = str(message.channel.id)
+            if thread_id is not None:
+                self._pause_state()[0].add(str(thread_id))
+                debug(f'Discord: escalated - thread {thread_id} paused')
+
+        if getattr(self, '_feedback_reactions', False):
+            sent_messages = outbound.get('messages') or []
+            if not sent_messages:
+                return
+            applied: List[str] = []
+            for emoji in getattr(self, '_feedback_emojis', []) or []:
+                if emoji and await self._react(sent_messages[-1], emoji):
+                    applied.append(emoji)
+            if applied:
+                outbound['feedbackEmojis'] = applied
+
+    async def _process_message(self, message: discord.Message):
+        """Route a message to the pipeline and send back its answer.
+
+        With ``mergeAttachments`` on a message that carries text
+        plus attachments produces ONE answer that has seen everything, the way
+        the support bot did: text-like files are folded into the question,
+        image/audio/video/other attachments still run as their own lane objects
+        first, and their answers are folded in as context before the single
+        text pass whose answer is posted. With it off, text and attachments are
+        ingested independently and only the first non-empty answer overall —
+        text first, then attachments in order — is sent back.
+
+        Either way every attachment is ingested (a message may carry up to 10)
+        and the reply is posted per the configured reply mode.
+
+        Args:
+            message (discord.Message): The message to process.
+
+        Returns:
+            None
+        """
+        metadata = self._message_metadata(message)
+        eligible_attachments = [
+            attachment
+            for attachment in message.attachments
+            if not isinstance(getattr(attachment, 'size', None), (int, float))
+            or attachment.size <= self._max_attachment_bytes
+        ]
+        merge = bool(getattr(self, '_merge_attachments', False)) and bool(message.attachments)
+        group_size = (1 if message.content else 0) + len(eligible_attachments)
+        group_index = 0
+        processing_errors: List[str] = []
+        try:
+            # Paused thread / message aimed at somebody else: stay quiet without
+            # ingesting anything, exactly as the support bot does.
+            skip_reason = await self._skip_reason(message)
+            if skip_reason is not None:
+                # The message itself still travels with the event: a team
+                # member answering inside a paused thread is the signal that a
+                # human took over, and no ``message`` event is emitted for it.
+                content = message.content if isinstance(message.content, str) else str(message.content or '')
+                await self._emit_no_reply_event(metadata, skip_reason, text=content[:2000])
+                return
+
             reply = ''
+            # What it would take to ask the text pass again; None when this
+            # message never had one (attachments only). Set by whichever branch
+            # below ran it, and consumed by the non-answer retry.
+            text_pass: Optional[Dict[str, Any]] = None
 
-            if message.content:
-                text_reply = await self._run_with_optional_typing(
-                    message,
-                    lambda: asyncio.to_thread(self._run_text_pipeline, message.content, message.channel.id, message.id),
-                )
-                if text_reply:
-                    reply = text_reply
+            if merge:
+                reply = await self._process_merged(message, metadata, eligible_attachments, processing_errors)
+                text_pass = metadata.pop('_textPass', None)
+            else:
+                if message.content:
+                    text_meta = dict(metadata, groupIndex=group_index, groupSize=group_size)
+                    group_index += 1
+                    # In a thread, carry the earlier conversation as context. The SSE
+                    # payload keeps the user's own words (plus how much context was
+                    # added) so a UI still shows the question that was asked.
+                    transcript = (
+                        await self._thread_transcript(message) if isinstance(message.channel, discord.Thread) else ''
+                    )
+                    pipeline_text = with_thread_context(message.content, transcript)
+                    text_reply = await self._run_with_optional_typing(
+                        message,
+                        lambda: asyncio.to_thread(
+                            self._run_text_pipeline,
+                            pipeline_text,
+                            message.channel.id,
+                            message.id,
+                            text_meta,
+                            sse_text=message.content,
+                            context_chars=len(transcript),
+                        ),
+                    )
+                    if text_reply:
+                        reply = text_reply
+                    if text_meta.get('_pipelineError'):
+                        processing_errors.append(text_meta.pop('_pipelineError'))
+                    text_pass = {
+                        'text': pipeline_text,
+                        'meta': text_meta,
+                        'sseText': message.content,
+                        'contextChars': len(transcript),
+                    }
 
-            # A single Discord message can carry up to 10 attachments. As a
-            # source node we ingest every one (each is downloaded, routed, and
-            # counted via monitorCompleted); only the first non-empty answer is
-            # kept for the reply.
-            for attachment in message.attachments:
-                att_reply = await self._process_attachment(message, attachment)
-                if att_reply and not reply:
-                    reply = att_reply
+                # A single Discord message can carry up to 10 attachments. As a
+                # source node we ingest every one (each is downloaded, routed, and
+                # counted via monitorCompleted); only the first non-empty answer is
+                # kept for the reply.
+                for attachment_index, attachment in enumerate(message.attachments):
+                    attachment_meta = dict(metadata, groupIndex=group_index, groupSize=group_size)
+                    if attachment in eligible_attachments:
+                        group_index += 1
+                    att_reply = await self._process_attachment(message, attachment, attachment_meta, attachment_index)
+                    if attachment_meta.get('_pipelineError'):
+                        processing_errors.append(attachment_meta.pop('_pipelineError'))
+                    if att_reply and not reply:
+                        reply = att_reply
+
+            # The literal team alias becomes a real role mention before anything
+            # else reads the answer: escalation-marker detection, the sanitizer
+            # and the posted text must all see the mention that pings the team.
+            reply = self._with_team_mention(reply)
+
+            if getattr(self, '_sanitize_replies', False):
+                if reply and looks_like_error(reply):
+                    # An engine or model failure arrived as the "answer" (a
+                    # provider error, a traceback). It is not a transient
+                    # non-answer, so it is neither relayed nor retried.
+                    debug(f'Discord: suppressed an error-looking answer for {message.id}: {reply[:160]}')
+                    await self._emit_no_reply_event(metadata, 'model_error')
+                    return
+
+                # Leaked agent scratchpad is not an answer: post the hand-off
+                # line when it escalated, otherwise ask once more (a ReAct agent
+                # that stopped at "Thought:" usually answers on a second run)
+                # before staying quiet. An empty answer is transient in the same
+                # way, so it is retried too — unless the pipeline itself failed
+                # for this message, where asking again only repeats the failure.
+                sanitized = sanitize_reply(reply, self._effective_markers()) if reply else ''
+                if not sanitized and text_pass is not None and (reply or not processing_errors):
+                    retry_errors: List[str] = []
+                    sanitized = await self._retry_non_answer(message, text_pass, retry_errors)
+                    if retry_errors:
+                        await self._emit_no_reply_event(metadata, 'model_error')
+                        return
+                if reply and not sanitized:
+                    # The pipeline did answer; nothing in it was postable.
+                    await self._emit_no_reply_event(metadata, 'non_answer')
+                    return
+                reply = sanitized
 
             if reply and self._send_responses:
-                await self._send_response(message, reply)
+                outbound = await self._send_response(message, reply)
+                if getattr(self, '_escalation_pause', False) or getattr(self, '_feedback_reactions', False):
+                    await self._after_send(message, reply, outbound)
+                if outbound.get('messageIds'):
+                    if getattr(self, '_emit_outbound', False):
+                        await self._emit_outbound_event(message, metadata, reply, outbound)
+                else:
+                    # There was an answer and posting it was wanted, but every
+                    # chunk failed (a missing Send Messages permission, a
+                    # deleted channel). Without this the question has a
+                    # ``message`` event and no outcome at all.
+                    await self._emit_no_reply_event(metadata, 'send_failed')
+            elif reply and getattr(self, '_emit_outbound', False):
+                # sendResponses is off: still make the answer observable downstream
+                await self._emit_outbound_event(
+                    message, metadata, reply, {'messageIds': [], 'destination': 'suppressed'}
+                )
+            elif not reply and getattr(self, '_emit_no_reply', False):
+                await self._emit_no_reply_event(metadata, processing_errors[0] if processing_errors else 'no_answer')
         except Exception as e:
             debug(f'Discord _process_message: EXCEPTION {e}')
+            if getattr(self, '_emit_no_reply', False):
+                await self._emit_no_reply_event(metadata, str(e))
+
+    async def _process_merged(
+        self,
+        message: discord.Message,
+        metadata: Dict[str, Any],
+        eligible_attachments: List[Any],
+        processing_errors: List[str],
+    ) -> str:
+        """Answer a message with attachments in a single text pass.
+
+        Mirrors the support bot's ``collectParts`` / ``combineIfNeeded``:
+        text-like files are folded into the question, every other attachment
+        still becomes its own lane object (same lane, same metadata, same SSE
+        event as when merging is off) and its answer is folded in as context.
+        The one text pass that follows is the reply; if it produces nothing the
+        first non-empty attachment answer is used, exactly as before.
+
+        Args:
+            message (discord.Message): The message being processed.
+            metadata (Dict[str, Any]): The per-message metadata contract.
+            eligible_attachments (List[Any]): Attachments within the size cap.
+            processing_errors (List[str]): Collects pipeline/download errors.
+
+        Returns:
+            str: The reply to post, or '' when nothing answered.
+        """
+        text_like: List[Any] = []
+        binaries: List[Any] = []
+        for attachment_index, attachment in enumerate(message.attachments):
+            if attachment in eligible_attachments and self._is_text_attachment(attachment):
+                text_like.append((attachment_index, attachment))
+            else:
+                # Oversized files go here too: _process_attachment skips them
+                # with a debug log, as it does when merging is off.
+                binaries.append((attachment_index, attachment))
+        eligible_binaries = [item for item in binaries if item[1] in eligible_attachments]
+
+        blocks: List[str] = []
+        for _attachment_index, attachment in text_like:
+            block = await self._folded_text_attachment(attachment, processing_errors)
+            if block:
+                blocks.append(block)
+
+        # groupSize has to be on the objects pushed below, before the text pass
+        # has happened: anything foldable means a text pass is coming. The one
+        # case that can still fall through (no text, no text file, and no
+        # attachment answered) leaves the count one high on objects already
+        # pushed, and behaves as it did before otherwise.
+        text_pass = bool(message.content or blocks or eligible_binaries)
+        group_size = (1 if text_pass else 0) + len(eligible_binaries)
+        group_index = 1 if text_pass else 0
+        first_answer = ''
+        for attachment_index, attachment in binaries:
+            attachment_meta = dict(metadata, groupIndex=group_index, groupSize=group_size)
+            if attachment in eligible_attachments:
+                group_index += 1
+            att_reply = await self._process_attachment(message, attachment, attachment_meta, attachment_index)
+            if attachment_meta.get('_pipelineError'):
+                processing_errors.append(attachment_meta.pop('_pipelineError'))
+            if not att_reply:
+                continue
+            if not first_answer:
+                first_answer = att_reply
+            kind = attachment_kind(guess_media_type(attachment.filename, attachment.content_type or ''))
+            blocks.append(fold_binary_answer(kind, attachment.filename, att_reply))
+
+        if not message.content and not blocks:
+            return first_answer
+
+        text_meta = dict(metadata, groupIndex=0, groupSize=group_size)
+        # Thread context is carried exactly as it is without attachments: only
+        # a message the user actually typed gets the transcript framing.
+        transcript = (
+            await self._thread_transcript(message)
+            if message.content and isinstance(message.channel, discord.Thread)
+            else ''
+        )
+        pipeline_text = compose_merged_question(with_thread_context(message.content, transcript), blocks)
+        text_reply = await self._run_with_optional_typing(
+            message,
+            lambda: asyncio.to_thread(
+                self._run_text_pipeline,
+                pipeline_text,
+                message.channel.id,
+                message.id,
+                text_meta,
+                sse_text=message.content or pipeline_text,
+                context_chars=len(pipeline_text) - len(message.content),
+            ),
+        )
+        if text_meta.get('_pipelineError'):
+            processing_errors.append(text_meta.pop('_pipelineError'))
+        # Hand the text pass back to _process_message (which pops the key right
+        # away) so a non-answer can be retried. Set last: every dict copied from
+        # ``metadata`` above has already been made, so the key never reaches an
+        # object's tag metadata or an emitted event.
+        metadata['_textPass'] = {
+            'text': pipeline_text,
+            'meta': text_meta,
+            'sseText': message.content or pipeline_text,
+            'contextChars': len(pipeline_text) - len(message.content),
+        }
+        return text_reply or first_answer
+
+    async def _retry_non_answer(
+        self,
+        message: discord.Message,
+        text_pass: Dict[str, Any],
+        errors: Optional[List[str]] = None,
+    ) -> str:
+        """Ask the text pass again after it produced nothing postable.
+
+        A ReAct agent that returned only scratchpad (``Thought:`` with no
+        ``Final Answer:``), or nothing at all, answers normally on a second
+        run, so up to ``nonAnswerRetries`` re-runs are attempted before the
+        node gives up. Each re-run uses the same pipeline text, metadata, and
+        SSE text as the original but a distinct object name, so a stateful
+        prompt node does not treat it as the object it already saw.
+
+        Args:
+            message (discord.Message): The message being answered.
+            text_pass (Dict[str, Any]): The original text pass (``text``,
+                ``meta``, ``sseText``, ``contextChars``).
+            errors (Optional[List[str]]): Collects ``'model_error'`` when a
+                re-run answered with an engine/model failure, which ends the
+                retries — the caller reports that instead of ``non_answer``.
+
+        Returns:
+            str: The first non-empty sanitized answer, or '' when none came.
+        """
+        retries = getattr(self, '_non_answer_retries', 0) or 0
+        markers = self._effective_markers()
+        for attempt in range(1, int(retries) + 1):
+            debug(f'Discord: non-answer reply for {message.id}, retry {attempt}/{retries}')
+            # A copy: a retry's pipeline error must not overwrite the original's.
+            meta = dict(text_pass['meta'])
+            answer = await self._run_with_optional_typing(
+                message,
+                lambda: asyncio.to_thread(
+                    self._run_text_pipeline,
+                    text_pass['text'],
+                    message.channel.id,
+                    message.id,
+                    meta,
+                    f'{message.id}:retry{attempt}',
+                    sse_text=text_pass['sseText'],
+                    context_chars=text_pass['contextChars'],
+                    retry=attempt,
+                ),
+            )
+            answer = self._with_team_mention(answer)
+            if answer and looks_like_error(answer):
+                debug(f'Discord: retry {attempt} for {message.id} returned an error, not an answer')
+                if errors is not None:
+                    errors.append('model_error')
+                return ''
+            reply = sanitize_reply(answer, markers) if answer else ''
+            if reply:
+                return reply
+        return ''
+
+    def _is_text_attachment(self, attachment: discord.Attachment) -> bool:
+        """Whether this attachment is decoded as text instead of routed as binary.
+
+        Args:
+            attachment (discord.Attachment): The attachment to classify.
+
+        Returns:
+            bool: True for a ``text/*`` MIME type or a configured extension,
+                and only when ``textAttachmentExtensions`` is configured: with
+                the list empty (the default) every attachment is routed as
+                binary, as before the setting existed.
+        """
+        extensions = getattr(self, '_text_attachment_extensions', [])
+        if not extensions:
+            return False
+        mime_type = guess_media_type(attachment.filename, attachment.content_type or '')
+        extension = os.path.splitext(attachment.filename)[1].lower()
+        return mime_type.startswith('text/') or extension in extensions
+
+    async def _folded_text_attachment(self, attachment: discord.Attachment, processing_errors: List[str]) -> str:
+        """Download one text-like attachment and render it for the question.
+
+        The caller has already applied the size cap; this applies the character
+        cap and drops files that turn out to hold binary content, as the
+        support bot does.
+
+        Args:
+            attachment (discord.Attachment): A text-like attachment.
+            processing_errors (List[str]): Collects a failed download's error.
+
+        Returns:
+            str: The block to fold in, or '' when the file is unusable.
+        """
+        try:
+            file_data = await attachment.read()
+        except Exception as e:
+            debug(f'Discord: attachment {attachment.filename} error: {e}')
+            processing_errors.append(str(e))
+            return ''
+        if not file_data:
+            return ''
+        decoded = file_data.decode('utf-8', errors='ignore')
+        if '\x00' in decoded:
+            debug(f'Discord: skipping attachment {attachment.filename} (binary content)')
+            return ''
+        return fold_text_attachment(attachment.filename, decoded, getattr(self, '_text_attachment_max_chars', 12000))
 
     async def _run_with_optional_typing(self, message: discord.Message, coro_factory):
         """Run an awaitable, optionally showing the Discord typing indicator.
@@ -465,7 +1576,13 @@ class IEndpoint(IEndpointBase):
                 except Exception as e:
                     debug(f'Discord: typing indicator failed to close: {e}')
 
-    async def _process_attachment(self, message: discord.Message, attachment: discord.Attachment) -> str:
+    async def _process_attachment(
+        self,
+        message: discord.Message,
+        attachment: discord.Attachment,
+        meta: Optional[Dict[str, Any]] = None,
+        attachment_index: int = 0,
+    ) -> str:
         """Download one attachment and route it to the matching lane.
 
         Args:
@@ -485,21 +1602,102 @@ class IEndpoint(IEndpointBase):
             file_data = await attachment.read()
             if not file_data:
                 return ''
+            if meta is None:
+                meta = self._message_metadata(message)
+            if self._is_text_attachment(attachment):
+                decoded = file_data.decode('utf-8', errors='ignore')
+                decoded = decoded[: getattr(self, '_text_attachment_max_chars', 12000)]
+                framed = f'[attachment {attachment.filename}]\n{decoded}'
+                return await self._run_with_optional_typing(
+                    message,
+                    lambda: asyncio.to_thread(
+                        self._run_text_pipeline,
+                        framed,
+                        message.channel.id,
+                        message.id,
+                        meta,
+                        f'{message.id}:{attachment_index}',
+                        attachment.id,
+                    ),
+                )
             return await self._run_with_optional_typing(
                 message,
                 lambda: asyncio.to_thread(
-                    self._run_binary_pipeline, file_data, mime_type, attachment.id, message.channel.id
+                    self._run_binary_pipeline,
+                    file_data,
+                    mime_type,
+                    attachment.id,
+                    message.channel.id,
+                    message.id,
+                    attachment_index,
+                    meta,
                 ),
             )
         except Exception as e:
             debug(f'Discord: attachment {attachment.filename} error: {e}')
+            if meta is not None:
+                meta['_pipelineError'] = str(e)
             return ''
 
     # -------------------------------------------------------------------------
     # Pipeline execution
     # -------------------------------------------------------------------------
 
-    def _run_text_pipeline(self, text: str, channel_id: int, message_id: int) -> str:
+    @staticmethod
+    def _send_metadata(pipe, metadata: Dict[str, Any]):
+        """Attach per-object metadata via the pipe's ``sendTagMetadata``.
+
+        ``sendTagMetadata`` is the engine's contract API for attaching a
+        metadata dict to the object flowing through the pipe (see
+        ``IServiceFilterPipe``); it does not touch the entry's url/name. Called
+        best-effort so a pipe implementation without it never breaks ingestion.
+        """
+        try:
+            pipe.sendTagMetadata(metadata)
+        except Exception as e:
+            debug(f'Discord: sendTagMetadata failed: {e}')
+
+    @staticmethod
+    def _send_sse(pipe, event_type: str, metadata: Dict[str, Any], payload: Dict[str, Any]):
+        """Broadcast the object as a real-time ``apaevt_sse`` event of type ``discord``.
+
+        Lets a UI (for example the Discord Dashboard app) follow questions,
+        answers, no-reply outcomes and reactions live. Pipeline traces never
+        carry tag-lane data or tag metadata, so SSE is the only channel that
+        exposes the node's metadata contract to a subscriber. Best-effort: a
+        missing ``rocketlib.engine`` (unit tests) or pipe id never breaks
+        ingestion.
+        """
+        try:
+            from rocketlib.engine import monitorSSE  # type: ignore  # engine-only module
+
+            pipe_id = getattr(pipe, 'pipeId', None)
+            if pipe_id is None:
+                return
+            monitorSSE(
+                pipe_id,
+                'discord',
+                {'schemaVersion': 1, 'eventType': event_type, 'metadata': metadata, **payload},
+            )
+        except Exception as e:
+            debug(f'Discord: monitorSSE failed: {e}')
+
+    def _new_entry(self, obj: Dict[str, Any]):
+        """Create an engine entry for a Discord object."""
+        return getObject(obj=obj)
+
+    def _run_text_pipeline(
+        self,
+        text: str,
+        channel_id: int,
+        message_id: int,
+        meta: Dict[str, Any],
+        object_name: Optional[str] = None,
+        attachment_id: Optional[int] = None,
+        sse_text: Optional[str] = None,
+        context_chars: int = 0,
+        retry: int = 0,
+    ) -> str:
         """Push a text message through the pipeline on the text lane.
 
         Blocking; must be called via asyncio.to_thread.
@@ -508,14 +1706,37 @@ class IEndpoint(IEndpointBase):
             text (str): The message text.
             channel_id (int): The originating channel id (entry URL).
             message_id (int): The originating message id (entry URL).
+            sse_text (Optional[str]): Text to broadcast instead of ``text`` —
+                the user's own message when thread context was prepended.
+            context_chars (int): Size of the prepended thread transcript.
+            retry (int): Which non-answer retry this run is (1-based). Reported
+                on the ``message`` SSE event so a UI can tell a re-run from the
+                original, which carries no ``retry`` key.
 
         Returns:
             str: The first pipeline answer, or '' on error / no answers.
         """
-        entry = getObject(obj={'url': f'discord://{channel_id}/{message_id}', 'name': text[:200]})
+        suffix = f'/{attachment_id}' if attachment_id is not None else ''
+        obj_meta = dict(meta, eventType='message')
+        entry = self._new_entry(
+            {
+                'url': f'discord://{channel_id}/{message_id}{suffix}',
+                'name': object_name or str(message_id),
+            }
+        )
         pipe = self.target.getPipe()
         try:
             pipe.open(entry)
+            self._send_metadata(pipe, obj_meta)
+            broadcast_text = text if sse_text is None else sse_text
+            payload: Dict[str, Any] = {
+                'lane': 'text',
+                'text': broadcast_text[:2000],
+                'contextChars': int(context_chars),
+            }
+            if retry > 0:
+                payload['retry'] = int(retry)
+            self._send_sse(pipe, 'message', obj_meta, payload)
             pipe.writeText(text)
             pipe.close()
             results = entry.response.toDict()
@@ -525,11 +1746,21 @@ class IEndpoint(IEndpointBase):
         except Exception as e:
             monitorFailed(len(text.encode('utf-8')))
             debug(f'Discord: text pipeline error: {e}')
+            meta['_pipelineError'] = str(e)
             return ''
         finally:
             self.target.putPipe(pipe)
 
-    def _run_binary_pipeline(self, file_data: bytes, mime_type: str, attachment_id: int, channel_id: int) -> str:
+    def _run_binary_pipeline(
+        self,
+        file_data: bytes,
+        mime_type: str,
+        attachment_id: int,
+        channel_id: int,
+        message_id: int,
+        attachment_index: int,
+        meta: Dict[str, Any],
+    ) -> str:
         """Push binary attachment data through the matching pipeline lane.
 
         Blocking; must be called via asyncio.to_thread.
@@ -543,10 +1774,11 @@ class IEndpoint(IEndpointBase):
         Returns:
             str: The first pipeline answer, or '' on error / no answers.
         """
-        entry = getObject(
-            obj={
-                'url': f'discord://{channel_id}/{attachment_id}',
-                'name': str(attachment_id),
+        obj_meta = dict(meta, eventType='message')
+        entry = self._new_entry(
+            {
+                'url': f'discord://{channel_id}/{message_id}/{attachment_id}',
+                'name': f'{message_id}:{attachment_index}',
                 'size': len(file_data),
                 'mimeType': mime_type,
             }
@@ -554,6 +1786,9 @@ class IEndpoint(IEndpointBase):
         pipe = self.target.getPipe()
         try:
             pipe.open(entry)
+            self._send_metadata(pipe, obj_meta)
+            binary_payload = {'lane': 'binary', 'mimeType': mime_type, 'size': len(file_data)}
+            self._send_sse(pipe, 'message', obj_meta, binary_payload)
             if mime_type.startswith('image/'):
                 pipe.writeImage(AVI_ACTION.BEGIN, mime_type)
                 pipe.writeImage(AVI_ACTION.WRITE, mime_type, file_data)
@@ -580,9 +1815,86 @@ class IEndpoint(IEndpointBase):
         except Exception as e:
             monitorFailed(len(file_data))
             debug(f'Discord: binary pipeline error ({mime_type}): {e}')
+            meta['_pipelineError'] = str(e)
             return ''
         finally:
             self.target.putPipe(pipe)
+
+    def _emit_event_pipeline(self, metadata: Dict[str, Any], event_type: str, payload: Dict[str, Any]):
+        """Emit a small tagged JSON event object without waiting for an answer."""
+        event_meta = dict(metadata, eventType=event_type)
+        message_id = event_meta.get('messageId') or event_meta.get('correlationId') or 'event'
+        channel_id = event_meta.get('channelId') or 'unknown'
+        entry = self._new_entry(
+            {
+                'url': f'discord://{channel_id}/{message_id}/{event_type}',
+                'name': f'{message_id}:{event_type}',
+            }
+        )
+        pipe = self.target.getPipe()
+        data = json.dumps({'eventType': event_type, 'metadata': event_meta, **payload}).encode('utf-8')
+        try:
+            pipe.open(entry)
+            self._send_metadata(pipe, event_meta)
+            self._send_sse(pipe, event_type, event_meta, payload)
+            pipe.writeTagBeginObject()
+            pipe.writeTagBeginStream()
+            pipe.writeTagData(data)
+            pipe.writeTagEndStream()
+            pipe.writeTagEndObject()
+            pipe.close()
+            monitorCompleted(len(data))
+        except Exception as e:
+            monitorFailed(len(data))
+            debug(f'Discord: {event_type} event pipeline error: {e}')
+        finally:
+            self.target.putPipe(pipe)
+
+    async def _emit_no_reply_event(self, metadata: Dict[str, Any], reason: str, text: Optional[str] = None):
+        """Emit one ``no_reply`` event.
+
+        The reason is clipped to :data:`MAX_NO_REPLY_REASON_CHARS` here, at the
+        one place every reason passes through: a reason built from an exception
+        message is unbounded, and it becomes the capture log's dedupe key.
+
+        Args:
+            metadata (Dict[str, Any]): The message's metadata contract.
+            reason (str): Why nothing was posted.
+            text (Optional[str]): The message content, for a message that was
+                skipped without being ingested — nothing else records it. Left
+                off every other reason, whose question is already on a
+                ``message`` event.
+        """
+        if not getattr(self, '_emit_no_reply', False):
+            return
+        payload: Dict[str, Any] = {'reason': str(reason)[:MAX_NO_REPLY_REASON_CHARS]}
+        if text is not None:
+            payload['text'] = text
+        await asyncio.to_thread(self._emit_event_pipeline, metadata, 'no_reply', payload)
+
+    async def _emit_outbound_event(
+        self,
+        message: discord.Message,
+        metadata: Dict[str, Any],
+        text: str,
+        outbound: Optional[Dict[str, Any]],
+    ):
+        if not getattr(self, '_emit_outbound', False):
+            return
+        details = outbound or {'messageIds': [], 'destination': self._reply_mode}
+        payload: Dict[str, Any] = {
+            'messageIds': details['messageIds'],
+            'destination': details['destination'],
+            'text': text,
+        }
+        if details.get('feedbackEmojis'):
+            payload['feedbackEmojis'] = details['feedbackEmojis']
+        await asyncio.to_thread(
+            self._emit_event_pipeline,
+            dict(metadata, groupIndex=0, groupSize=1),
+            'outbound',
+            payload,
+        )
 
     # -------------------------------------------------------------------------
     # Replies
@@ -605,9 +1917,12 @@ class IEndpoint(IEndpointBase):
             None
         """
         thread = None
-        for chunk in chunk_message(response):
+        sent_ids: List[str] = []
+        destinations: List[str] = []
+        sent_messages: List[Any] = []
+        for chunk in chunk_message(response, number=bool(getattr(self, '_number_chunks', False))):
             try:
-                thread = await self._send_chunk(message, chunk, thread)
+                thread = await self._send_chunk(message, chunk, thread, sent_ids, destinations, sent_messages)
             except discord.RateLimited as e:
                 # discord.py handles 429s internally (honoring Retry-After) and
                 # only surfaces RateLimited when the client sets
@@ -616,32 +1931,105 @@ class IEndpoint(IEndpointBase):
                 debug(f'Discord: rate limited; retrying after {e.retry_after}s')
                 await asyncio.sleep(float(e.retry_after))
                 try:
-                    thread = await self._send_chunk(message, chunk, thread)
+                    thread = await self._send_chunk(message, chunk, thread, sent_ids, destinations, sent_messages)
                 except Exception as e2:
                     debug(f'Discord: send retry failed, abandoning remaining chunks: {e2}')
-                    return
+                    break
             except Exception as e:
                 debug(f'Discord: send failed, abandoning remaining chunks: {e}')
-                return
+                break
+        destination = destinations[0] if destinations else self._reply_mode
+        # ``messages`` and ``threadId`` stay internal (the escalation pause and
+        # the feedback reactions need them); the emitted event keeps its shape.
+        return {
+            'messageIds': sent_ids,
+            'destination': destination,
+            'threadId': str(thread.id) if thread is not None and getattr(thread, 'id', None) is not None else None,
+            'messages': sent_messages,
+        }
 
-    async def _send_chunk(self, message: discord.Message, chunk: str, thread):
+    def _allowed_mentions(self):
+        """Build the outbound mention allowlist; never permit everyone/here."""
+        role_ids = getattr(self, '_allowed_mention_role_ids', [])
+        user_ids = getattr(self, '_allowed_mention_user_ids', [])
+        if not role_ids and not user_ids:
+            return discord.AllowedMentions.none()
+        return discord.AllowedMentions(
+            everyone=False,
+            users=[discord.Object(id=int(user_id)) for user_id in user_ids],
+            roles=[discord.Object(id=int(role_id)) for role_id in role_ids],
+        )
+
+    def _thread_name_for(self, message: discord.Message) -> str:
+        """Resolve the response thread's name from the configured template.
+
+        ``{content}`` is the triggering message's text; a message that carries
+        only files has none, so the first attachment's filename stands in for
+        it (the support bot's ``text || firstAttachment.name || 'Support'``).
+        The resolved name is capped by ``threadNameMaxLength``, and the node's
+        own default is used when nothing is left.
+
+        Args:
+            message (discord.Message): The triggering message.
+
+        Returns:
+            str: The thread name to create.
+        """
+        content = message.content if isinstance(message.content, str) else str(message.content or '')
+        if not content.strip():
+            attachments = getattr(message, 'attachments', None) or []
+            if attachments:
+                content = str(getattr(attachments[0], 'filename', '') or '')
+        thread_name = getattr(self, '_thread_name', 'Pipeline Response').replace('{content}', content)
+        thread_name = thread_name[: getattr(self, '_thread_name_max_length', 90)].strip()
+        return thread_name or 'Pipeline Response'
+
+    @staticmethod
+    def _record_sent(
+        sent,
+        destination: str,
+        sent_ids: Optional[List[str]],
+        destinations: Optional[List[str]],
+        sent_messages: Optional[List[Any]] = None,
+    ):
+        if sent_ids is not None and sent is not None and getattr(sent, 'id', None) is not None:
+            sent_ids.append(str(sent.id))
+        if destinations is not None:
+            destinations.append(destination)
+        if sent_messages is not None and sent is not None:
+            sent_messages.append(sent)
+
+    async def _send_chunk(
+        self,
+        message: discord.Message,
+        chunk: str,
+        thread,
+        sent_ids: Optional[List[str]] = None,
+        destinations: Optional[List[str]] = None,
+        sent_messages: Optional[List[Any]] = None,
+    ):
         """Send a single chunk using the configured reply mode.
 
         Args:
             message (discord.Message): The originating message.
             chunk (str): The chunk text (already within the char limit).
             thread: The thread created for a prior chunk, or None.
+            sent_ids: Collects the posted message ids.
+            destinations: Collects the destination used per chunk.
+            sent_messages: Collects the posted message objects (the feedback
+                reactions go on the last one).
 
         Returns:
             The thread used (for 'thread' mode) so later chunks reuse it, else None.
         """
-        # Suppress all mentions on outbound content: the reply is model-generated
-        # text and must never ping users, roles, @here or @everyone even if it
-        # contains mention syntax.
-        no_mentions = discord.AllowedMentions.none()
+        # Outbound content is model-generated: by default all mentions are
+        # suppressed. Only the explicitly configured allowedMentionRoleIds /
+        # allowedMentionUserIds may ping; @everyone/@here are never allowed.
+        allowed_mentions = self._allowed_mentions()
 
         if self._reply_mode == 'reply':
-            await message.reply(chunk, mention_author=False, allowed_mentions=no_mentions)
+            sent = await message.reply(chunk, mention_author=False, allowed_mentions=allowed_mentions)
+            self._record_sent(sent, 'reply', sent_ids, destinations, sent_messages)
             return None
 
         if self._reply_mode == 'thread':
@@ -652,14 +2040,43 @@ class IEndpoint(IEndpointBase):
                     # rather than trying to create a nested one (which fails).
                     thread = channel
                 elif isinstance(channel, discord.TextChannel):
-                    thread = await message.create_thread(name='Pipeline Response')
+                    # Discord accepts exactly four durations. No duration
+                    # configured (0) — or any value Discord would reject, which
+                    # would 400 and cost the whole answer — leaves it to the
+                    # channel's own default, as discord.py does when the
+                    # argument is absent.
+                    thread_kwargs: Dict[str, Any] = {'name': self._thread_name_for(message)}
+                    archive_minutes = self._as_int(getattr(self, '_thread_auto_archive_minutes', 0), 0)
+                    if archive_minutes in THREAD_ARCHIVE_DURATIONS:
+                        thread_kwargs['auto_archive_duration'] = archive_minutes
+                    elif archive_minutes:
+                        debug(
+                            f'Discord: threadAutoArchiveMinutes={archive_minutes} is not one of '
+                            f'{", ".join(str(value) for value in THREAD_ARCHIVE_DURATIONS)}; '
+                            f"using the channel's default"
+                        )
+                    try:
+                        thread = await message.create_thread(**thread_kwargs)
+                    except Exception as e:
+                        # Usually a missing "Create Public Threads" /
+                        # "Send Messages in Threads": reply in the channel
+                        # instead of losing the whole answer.
+                        debug(f'Discord: create_thread failed, replying in the channel instead: {e}')
+                        thread = _THREAD_FALLBACK
                 else:
                     # DMs and other non-threadable channels cannot host a
                     # thread; fall back to a plain reply.
-                    await message.reply(chunk, mention_author=False, allowed_mentions=no_mentions)
+                    sent = await message.reply(chunk, mention_author=False, allowed_mentions=allowed_mentions)
+                    self._record_sent(sent, 'reply', sent_ids, destinations, sent_messages)
                     return None
-            await thread.send(chunk, allowed_mentions=no_mentions)
+            if thread is _THREAD_FALLBACK:
+                sent = await message.reply(chunk, mention_author=False, allowed_mentions=allowed_mentions)
+                self._record_sent(sent, 'reply', sent_ids, destinations, sent_messages)
+                return _THREAD_FALLBACK
+            sent = await thread.send(chunk, allowed_mentions=allowed_mentions)
+            self._record_sent(sent, 'thread', sent_ids, destinations, sent_messages)
             return thread
 
-        await message.channel.send(chunk, allowed_mentions=no_mentions)
+        sent = await message.channel.send(chunk, allowed_mentions=allowed_mentions)
+        self._record_sent(sent, 'channel', sent_ids, destinations, sent_messages)
         return None
