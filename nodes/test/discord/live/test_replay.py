@@ -42,7 +42,7 @@ _RUN_DIR = os.path.join(_REPO_ROOT, '.context', 'replay-runs')
 def parse_seeds(path: str = _SEEDS_FILE) -> List[Dict[str, str]]:
     """Parse the seed table: one dict per row with id, question, topic, expectation."""
     seeds: List[Dict[str, str]] = []
-    with open(path) as handle:
+    with open(path, encoding='utf-8') as handle:
         for line in handle:
             line = line.strip()
             if not line.startswith('|'):
@@ -81,7 +81,7 @@ def replay_log():
     os.makedirs(_RUN_DIR, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     path = os.path.join(_RUN_DIR, f'{stamp}.jsonl')
-    with open(path, 'w') as handle:
+    with open(path, 'w', encoding='utf-8') as handle:
         for row in rows:
             handle.write(json.dumps(row) + '\n')
     print(f'\nreplay run written: {path} ({len(rows)} seeds)')

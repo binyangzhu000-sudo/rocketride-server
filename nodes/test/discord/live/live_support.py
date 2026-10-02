@@ -77,13 +77,13 @@ live_only = pytest.mark.skipif(
 
 def load_token() -> str:
     """Return the bot token. Never log, print, or assert on the value."""
-    with open(_TOKEN_FILE) as handle:
+    with open(_TOKEN_FILE, encoding='utf-8') as handle:
         return json.load(handle)['token']
 
 
 def load_ids() -> Dict[str, str]:
     """Return the live id map; empty strings mean 'not provided'."""
-    with open(_IDS_FILE) as handle:
+    with open(_IDS_FILE, encoding='utf-8') as handle:
         return json.load(handle)
 
 
@@ -345,7 +345,7 @@ class StubTarget:
 
 def services_defaults() -> Dict[str, Any]:
     """Every ``discord.*`` config default straight out of ``services.json``."""
-    with open(_SERVICES_JSON) as handle:
+    with open(_SERVICES_JSON, encoding='utf-8') as handle:
         services = json.load(handle)
     defaults: Dict[str, Any] = {}
     for key, field in services['fields'].items():
@@ -858,7 +858,7 @@ def load_driver_token(config: Dict[str, str]) -> str:
     """Return the driver bot token. Never log, print, or assert on the value."""
     path = driver_token_path(config)
     key = config.get('driverTokenEnvKey', '')
-    with open(path) as handle:
+    with open(path, encoding='utf-8') as handle:
         for line in handle:
             line = line.strip()
             if not line or line.startswith('#') or '=' not in line:

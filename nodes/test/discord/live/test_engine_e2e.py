@@ -66,7 +66,7 @@ requires_engine = pytest.mark.skipif(bool(SKIP_REASON), reason=SKIP_REASON or 'e
 
 def _pipeline(config, *, reply_mode: str):
     """``engine_min.pipe`` with the two knobs each test owns set in code."""
-    with open(PIPE_PATH) as handle:
+    with open(PIPE_PATH, encoding='utf-8') as handle:
         pipeline = json.load(handle)
     component = next(item for item in pipeline['components'] if item['id'] == 'discord_1')
     parameters = component['config']['parameters']
