@@ -40,7 +40,8 @@ debugging your code.
 3. When the engine starts, it seeds every app listed in `apps.json` into its
    store as a version, copying the files from `static/apps/<appId>/`. It does
    this when the app has no version yet, or when the `version` in the app's
-   `package.json` differs from the one it seeded last. (RocketRide Cloud runs
+   `package.json` differs from the one it seeded last. An app with no
+   `version` in its `package.json` is never re-seeded. (RocketRide Cloud runs
    the same seeding from its deploy tooling instead of at startup.)
 
 What follows from that:
@@ -52,9 +53,14 @@ What follows from that:
   `apps/my-app` with the id `rocketride.myApp` builds to
   `build/apps/rocketride.myApp/`. The seeding step looks the bundle up by id,
   so a folder named after anything else is never found and the app does not
-  load.
-- **`static/apps/<appId>/` is not where browsers get app code.** Only an app's
-  assets, such as its icon and readme, are served directly from that folder.
+  load. The id is required: when it is missing, the builder's shared app
+  module (`scripts/lib/appModule.js`) falls back to the folder name for its
+  own paths only and prints a `Warning: ... has no appManifest.id` line. That
+  fallback does not give you a working app, so add the id when you see the
+  warning.
+- **`static/apps/<appId>/` is not where the shell loads app code from.** The
+  shell only requests bundles from the versioned URL. Direct requests to that
+  folder are meant for assets such as the icon and readme.
 - **A standalone app's `dist/` is never served.** Its preview loads from the
   App Builder's dev server, and its users load a version the server built from
   the deployed source. See "Build Configuration" in
@@ -207,7 +213,13 @@ import { pluginReact } from '@rsbuild/plugin-react';
 import { pluginModuleFederation } from '@module-federation/rsbuild-plugin';
 
 const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'package.json'), 'utf-8'));
-const moduleId = (pkg.appManifest?.id ?? 'unknown').replace(/[^a-zA-Z0-9_$]/g, '_');
+// The app id keys the build output dir and the served static dir, so fail the
+// build when it is missing instead of building under a wrong name.
+const appId = pkg.appManifest?.id;
+if (typeof appId !== 'string' || appId.length === 0) {
+  throw new Error('package.json must define a non-empty appManifest.id');
+}
+const moduleId = appId.replace(/[^a-zA-Z0-9_$]/g, '_');
 
 export default defineConfig(() => ({
   plugins: [
@@ -231,7 +243,7 @@ export default defineConfig(() => ({
   source: { entry: { index: './src/index.ts' } },
   output: {
     // Keyed on appManifest.id so it matches the folder the copy step reads.
-    distPath: { root: `../../build/apps/${pkg.appManifest.id}` },
+    distPath: { root: `../../build/apps/${appId}` },
     assetPrefix: 'auto',
     cleanDistPath: true,
     sourceMap: { js: 'source-map', css: true },
