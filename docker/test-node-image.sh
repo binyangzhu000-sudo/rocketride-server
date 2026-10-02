@@ -30,20 +30,35 @@ assert stored == now, f'shipped constraints are stale in a container: {stored} !
 print('image probe ok')
 "
 
-# Nodes whose dependencies must install from the baked cache with no network.
-# Between them: opencv pulled in transitively (mediapipe, img2table), the
-# onnxruntime-gpu / ctranslate2 / av stack, and an override (crewai's mcp cap).
+# Every requirement file the cache was warmed from must install with no network:
+# a miss would reach for PyPI and fail. In production a miss is only slower, which
+# is exactly why nothing else would notice one. The list is what the warm step
+# wrote into the image, so new nodes are covered and files that never resolved
+# (listed in the build log) are not expected to.
+# shellcheck disable=SC2016 # expands inside the container, where the image sets it
+warmed=$(run "$image" sh -c 'cat "$UV_CACHE_DIR/warmed.txt"')
+if [ -z "$warmed" ]; then
+    echo "FATAL: the image lists no warmed requirement files"
+    exit 1
+fi
+
+total=0
+missed=0
 failed=''
-for node in face_detection ocr audio_transcribe agent_crewai; do
-    echo "Installing $node offline from the cache..."
+for req in $warmed; do
+    total=$((total + 1))
     if ! run --network none -e UV_OFFLINE=1 "$image" ./engine -c \
-            "from depends import depends; depends('nodes/$node/requirements.txt')"; then
-        failed="$failed $node"
+            "from depends import depends; depends('$req')" > /dev/null 2>&1; then
+        echo "  not from the cache: $req"
+        missed=$((missed + 1))
+        failed="$failed $req"
     fi
 done
 
 if [ -n "$failed" ]; then
-    echo "FATAL: did not install offline:$failed"
+    echo "FATAL: $missed of $total requirement files did not install offline:"
+    for req in $failed; do echo "  $req"; done
+    echo "Rerun one to see why: docker run --rm --network none -e UV_OFFLINE=1 $image ./engine -c \"from depends import depends; depends('<file>')\""
     exit 1
 fi
-echo "$image: engine probe and offline installs passed"
+echo "$image: engine probe passed, $total requirement files installed offline"

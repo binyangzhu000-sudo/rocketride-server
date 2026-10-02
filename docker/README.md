@@ -124,8 +124,13 @@ builds engine-base and the node image from the local `dist/server`; elsewhere
 `dist/server` is not a Linux engine and the task skips. `./builder
 nodes:test-container` builds them and checks the node image as a run gets it:
 with capabilities dropped the engine is non-dumpable, the shipped constraints
-are accepted as they are, and a sample of nodes installs from the wheel cache
-with no network (`docker/test-node-image.sh`). CI runs it on Linux when the image's inputs change, and the release workflow
+are accepted as they are, and every requirement file the cache was warmed from
+installs from it with no network (`docker/test-node-image.sh`). Files whose
+resolution needs torch are not warmed: the warm step lists them, and fails the
+build unless the file is installed only without a model server (`torch_allowed`
+in `docker/warm-wheel-cache.sh`) — otherwise every run would download a CUDA
+torch.
+CI runs it on Linux when the image's inputs change, and the release workflow
 runs the same script on the published node image before signing it. All three
 published images are cosign-signed. The node image has no `latest` tag on
 purpose: a server starts tasks only from the node image of its own version.

@@ -14,7 +14,24 @@
 #   its CUDA build alone is gigabytes. Excluded transitively too.
 # - Best effort: a file that does not resolve here does not install at run time
 #   either. Each one is listed at the end.
+# - Each file is also resolved with torch allowed. A file that needs torch goes
+#   to $UV_CACHE_DIR/needs-torch.txt and is only allowed where it is installed
+#   without a model server (torch_allowed below); anywhere else it would put a
+#   CUDA torch into every run, and the build fails. The rest go to
+#   $UV_CACHE_DIR/warmed.txt: what the cache promises, and what
+#   test-node-image.sh installs offline.
 set -eu
+
+# Files that may need torch: installed only without a model server, where the
+# run does its own inference (rocketride-server#2443).
+torch_allowed() {
+    case "$1" in
+        ai/common/models/*) return 0 ;;                # model loaders: local path only
+        nodes/audio_tts/requirements.txt) return 0 ;;  # depends() only without a model server
+        nodes/anonymize/requirements.txt) return 0 ;;  # never installed by the node: GLiNER comes through ai.common.models
+    esac
+    return 1
+}
 
 # The engine resolves: cache/constraints.txt and cache/overrides-combined.txt,
 # from every requirement file. In the node image engine-base already did it
@@ -41,6 +58,9 @@ printf 'torch\ntorchvision\ntorchaudio\n' >> "$excludes"
 
 total=0
 failed=''
+warmed=''
+needs_torch=''
+forbidden=''
 for req in $(find nodes ai -name 'requirement*.txt' | sort); do
     case "$req" in
         ai/common/torch/*) continue ;;
@@ -56,15 +76,40 @@ for req in $(find nodes ai -name 'requirement*.txt' | sort); do
             --no-build-isolation \
             --excludes "$excludes"; then
         failed="$failed $req"
+    elif ./bin/uv pip install --dry-run \
+            -r "$req" \
+            "$@" \
+            --python ./engine \
+            --target "$target" \
+            --index-strategy unsafe-best-match \
+            --no-build-isolation \
+            --excludes "$engine_excludes" 2>&1 | grep -qE '^ \+ torch=='; then
+        needs_torch="$needs_torch $req"
+        torch_allowed "$req" || forbidden="$forbidden $req"
+    else
+        warmed="$warmed $req"
     fi
     rm -rf "$target"
 done
 rm -f "$excludes"
 
+for req in $warmed; do echo "$req"; done > "$UV_CACHE_DIR/warmed.txt"
+for req in $needs_torch; do echo "$req"; done > "$UV_CACHE_DIR/needs-torch.txt"
+
 echo "Warmed from $total requirement files."
 if [ -n "$failed" ]; then
     echo "Did not resolve (fails at run time too):"
     for req in $failed; do echo "  $req"; done
+fi
+if [ -n "$needs_torch" ]; then
+    echo "Need torch, not warmed (installed only without a model server):"
+    for req in $needs_torch; do echo "  $req"; done
+fi
+if [ -n "$forbidden" ]; then
+    echo "FATAL: these requirement files pull torch, and a run installs them even with a model server:"
+    for req in $forbidden; do echo "  $req"; done
+    echo "Drop the dependency that pulls torch, or, if the file is installed only without a model server, add it to torch_allowed with the reason."
+    exit 1
 fi
 
 # Fail closed on torch: a declaration change must not bring gigabytes back
