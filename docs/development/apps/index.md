@@ -19,10 +19,46 @@ and that difference is what this page covers.
 | **Install** | `npm install rocketride` | workspace link (`shell` override) + `rocketride: workspace:*` |
 | **MF shared** | `rocketride/app-sdk` | `shell` + `rocketride` |
 | **Build** | `npx rsbuild build` | `./builder my-app:build` |
-| **Deploy** | Upload `dist/` to CDN | Builder copies to server static |
+| **Deploy** | Deploy from the App Builder; the server builds from source | Builder copies to server static; the engine seeds it as a version |
 
 Monorepo apps import types from `shell` rather than `rocketride/app-sdk`; the
 type names, hooks, and functions are identical.
+
+## What the server serves
+
+A browser never loads an app from the folder a build writes to. Outside a
+dev-server preview, it loads app code from one place only: a versioned URL,
+`/apps/<appId>/v<N>/remoteEntry.js`, whose files the engine reads from its own
+store. If a rebuild does not show up in the browser, check this chain before
+debugging your code.
+
+`./builder my-app:build` moves a monorepo app's bundle through three places:
+
+1. `rsbuild build` writes it to `build/apps/<appId>/`.
+2. The copy step syncs that folder to `dist/server/static/apps/<appId>/`, next
+   to the engine binary.
+3. When the engine starts, it seeds every app listed in `apps.json` into its
+   store as a version, copying the files from `static/apps/<appId>/`. It does
+   this when the app has no version yet, or when the `version` in the app's
+   `package.json` differs from the one it seeded last. (RocketRide Cloud runs
+   the same seeding from its deploy tooling instead of at startup.)
+
+What follows from that:
+
+- **A rebuild alone changes nothing a browser sees.** The engine keeps serving
+  the version it already seeded. To pick up a rebuild, change `version` in the
+  app's `package.json`, rebuild, and restart the engine.
+- **`<appId>` is `appManifest.id`, not the folder name.** An app in
+  `apps/my-app` with the id `rocketride.myApp` builds to
+  `build/apps/rocketride.myApp/`. The seeding step looks the bundle up by id,
+  so a folder named after anything else is never found and the app does not
+  load.
+- **`static/apps/<appId>/` is not where browsers get app code.** Only an app's
+  assets, such as its icon and readme, are served directly from that folder.
+- **A standalone app's `dist/` is never served.** Its preview loads from the
+  App Builder's dev server, and its users load a version the server built from
+  the deployed source. See "Build Configuration" in
+  `docs/agents/context/ROCKETRIDE_APPS.md`.
 
 ---
 
@@ -134,8 +170,10 @@ const { execCommand, syncDir, formatSyncStats, removeDir, BUILD_ROOT, DIST_ROOT 
 const { registerApp } = require('../../../scripts/lib/registerApp');
 
 const APP_ROOT = path.join(__dirname, '..');
-const BUILD_DIR = path.join(BUILD_ROOT, 'apps', 'my-app');
-const SERVER_STATIC_DIR = path.join(DIST_ROOT, 'server', 'static', 'apps', 'my-app');
+// Both folders are keyed on appManifest.id, not the folder name.
+const APP_ID = require('../package.json').appManifest.id;
+const BUILD_DIR = path.join(BUILD_ROOT, 'apps', APP_ID);
+const SERVER_STATIC_DIR = path.join(DIST_ROOT, 'server', 'static', 'apps', APP_ID);
 
 module.exports = {
   name: 'my-app',
@@ -192,7 +230,8 @@ export default defineConfig(() => ({
   server: { port: 3014 },
   source: { entry: { index: './src/index.ts' } },
   output: {
-    distPath: { root: '../../build/apps/my-app' },
+    // Keyed on appManifest.id so it matches the folder the copy step reads.
+    distPath: { root: `../../build/apps/${pkg.appManifest.id}` },
     assetPrefix: 'auto',
     cleanDistPath: true,
     sourceMap: { js: 'source-map', css: true },
