@@ -144,7 +144,8 @@ def _numbered_chunks(text: str, max_length: int) -> List[str]:
     total = len(chunks)
     if total < 2:
         return chunks
-    return [piece + _chunk_label(index, total) for index, piece in enumerate(chunks, 1)]
+    # A piece's trailing blank lines would sit between its text and the label.
+    return [piece.rstrip() + _chunk_label(index, total) for index, piece in enumerate(chunks, 1)]
 
 
 def chunk_message(text: str, max_length: int = DISCORD_MESSAGE_CHAR_LIMIT, number: bool = False) -> List[str]:
@@ -269,6 +270,19 @@ def _chunk_fenced_message(text: str, max_length: int) -> List[str]:
         reserved_close = 4
         capacity = max(1, max_length - len(prefix) - reserved_close)
         end = min(len(text), position + capacity)
+        # Break between lines when the window has a newline in its second half:
+        # a code line cut in two cannot be copied out of either message. The
+        # newline is not emitted; the synthetic close/reopen pair stands in for
+        # it (consumed below). A newline right before a fence is passed over, so
+        # a boundary never produces an empty code block.
+        line_break = False
+        if end < len(text):
+            newline = text.rfind('\n', position, end)
+            while newline > position + capacity // 2 and text.startswith('```', newline + 1):
+                newline = text.rfind('\n', position, newline)
+            if newline > position + capacity // 2:
+                end = newline
+                line_break = True
         end = _safe_fence_boundary(text, position, end)
         if end <= position:
             end = min(len(text), position + 1)
@@ -288,6 +302,8 @@ def _chunk_fenced_message(text: str, max_length: int) -> List[str]:
         if chunk.strip():
             chunks.append(chunk)
         position = end
+        if line_break and next_open and text.startswith('\n', end):
+            position = end + 1
         is_open, language = next_open, next_language
 
     return chunks

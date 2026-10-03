@@ -205,6 +205,39 @@ class TestChunkMessage:
         joined = ''.join(chunks).replace('\n``````python\n', '')
         assert ''.join(joined.split()) == ''.join(text.split())
 
+    def test_a_long_code_block_splits_between_lines(self):
+        # Live F12/F44: every boundary inside a fence used to cut a code line in
+        # two, so a copied block was broken. Each message must hold whole lines.
+        body = ''.join(f'line {index:04d} ' + 'x' * 12 + '\n' for index in range(300))
+        text = 'Intro\n```\n' + body + '```\nOutro'
+        chunks = chunk_message(text)
+
+        assert len(chunks) > 2
+        assert all(len(chunk) <= DISCORD_MESSAGE_CHAR_LIMIT for chunk in chunks)
+        full_line = re.compile(r'^line \d{4} x{12}$')
+        for chunk in chunks:
+            for line in chunk.splitlines():
+                if line.startswith('line '):
+                    assert full_line.match(line), f'cut mid-line: {line!r}'
+        # The fence pair standing in for each boundary newline is the only change.
+        assert ''.join(chunks).replace('\n``````\n', '\n') == text
+
+    def test_a_single_line_longer_than_a_chunk_is_still_split(self):
+        # No newline to break on: the length guarantee still holds.
+        text = '```\n' + 'y' * 5000 + '\n```'
+        chunks = chunk_message(text)
+        assert all(len(chunk) <= DISCORD_MESSAGE_CHAR_LIMIT for chunk in chunks)
+        assert ''.join(chunks).replace('\n``````\n', '').count('y') == 5000
+
+    def test_a_numbered_last_chunk_has_no_trailing_blank_lines(self):
+        # Live F12: the answer's trailing newlines sat between the closing fence
+        # and the label as blank lines.
+        body = ''.join(f'line {index:04d} ' + 'x' * 12 + '\n' for index in range(150))
+        numbered = chunk_message('```\n' + body + '```\n\n\n', number=True)
+        total = len(numbered)
+        assert total > 1
+        assert numbered[-1].endswith(f'```\n\n*({total}/{total})*')
+
 
 class TestGuessMediaType:
     """Test the real guess_media_type helper."""
