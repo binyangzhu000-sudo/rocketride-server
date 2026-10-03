@@ -372,6 +372,20 @@ class TestLooksLikeError:
         assert looks_like_error('An error occurred with the OpenAI API: timeout') is True
         assert looks_like_error('an error occurred with the anthropic api') is True
 
+    def test_the_engine_llm_error_answer_is_an_error(self):
+        # Live F40: the engine's LLM layer turned a provider failure into this
+        # answer text, and it was posted to Discord with sanitizeReplies on.
+        assert looks_like_error('**LLM error** — ValueError: An error occurred with the API.') is True
+        assert looks_like_error('  **LLM error**: Rate limit exceeded. Please try again later.') is True
+
+    def test_the_bare_api_error_sentence_is_an_error(self):
+        assert looks_like_error('An error occurred with the API.') is True
+        assert looks_like_error('ValueError: An error occurred with the API.') is True
+
+    def test_prose_about_api_errors_is_not_an_error(self):
+        assert looks_like_error('If an error occurred with the API call, check your key and retry.') is False
+        assert looks_like_error('The log once said **LLM error**; here is what it means.') is False
+
     def test_an_engine_stack_frame_is_an_error(self):
         assert looks_like_error('... raised in chat.py:412 while answering') is True
         assert looks_like_error('agent.py:77 blew up') is True

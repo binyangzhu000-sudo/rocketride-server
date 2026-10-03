@@ -55,6 +55,12 @@ _ERROR_SIGNATURES = (
     re.compile(r'Traceback \(most recent call last\)', re.IGNORECASE),
     re.compile(r'^\s*(Exception|Error)\s*:', re.IGNORECASE),
     re.compile(r'Error code:\s*\d{3}\b', re.IGNORECASE),
+    # The engine's LLM layer reports a provider failure as the answer itself:
+    # ``**LLM error** — ValueError: An error occurred with the API.``
+    re.compile(r'^\s*\*\*LLM error\*\*'),
+    # ...and the sentence its mapped exception carries, when that sentence is the
+    # whole answer (prose that merely mentions API errors is not matched).
+    re.compile(r'^\s*(?:\w+Error:\s*)?an error occurred with the api\.?\s*$', re.IGNORECASE),
 )
 
 # Chunk numbering: each chunk ends with '\n\n*(3/7)*' when it is turned on.
