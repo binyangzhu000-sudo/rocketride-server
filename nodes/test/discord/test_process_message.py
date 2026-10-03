@@ -27,6 +27,7 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 from unittest import mock
 
@@ -160,6 +161,7 @@ def _load_endpoint_class():
 
 
 IEndpoint, discord = _load_endpoint_class()
+_ENDPOINT_MODULE = sys.modules['_discord_node.IEndpoint']
 
 
 # ---------------------------------------------------------------------------
@@ -2186,6 +2188,23 @@ class TestLifecycle:
         with pytest.raises(RuntimeError, match='missing bot token'):
             asyncio.run(endpoint._startup())
 
+    def test_an_unset_token_variable_is_named(self):
+        # Live F39: the engine passes an unknown ${NAME} through literally, and
+        # it used to be reported as "login failed (invalid token)".
+        endpoint = IEndpoint.__new__(IEndpoint)
+        endpoint._bot_token = '${ROCKETRIDE_DISCORD_NO_SUCH_TOKEN}'
+
+        with pytest.raises(RuntimeError, match='ROCKETRIDE_DISCORD_NO_SUCH_TOKEN is not set'):
+            asyncio.run(endpoint._startup())
+
+    def test_a_broken_channel_list_fails_the_start(self):
+        endpoint = IEndpoint.__new__(IEndpoint)
+        endpoint._bot_token = 'token'
+        endpoint._config_error = 'Discord Bot: channelIds is not valid JSON'
+
+        with pytest.raises(RuntimeError, match='channelIds is not valid JSON'):
+            asyncio.run(endpoint._startup())
+
     def test_login_failure_records_fatal_and_unblocks(self):
         endpoint = self._runner_endpoint()
         endpoint._bot.start = mock.AsyncMock(side_effect=discord.LoginFailure())
@@ -2205,6 +2224,18 @@ class TestLifecycle:
         assert endpoint._fatal_error is not None
         assert 'Message Content Intent' in endpoint._fatal_error
         assert endpoint._shutdown_event.is_set()
+
+    def test_members_intent_failure_leads_with_server_members(self):
+        # Live F36: with member metadata on, the missing intent is almost always
+        # Server Members; the message used to lead with Message Content.
+        endpoint = self._runner_endpoint()
+        endpoint._include_member_metadata = True
+        endpoint._bot.start = mock.AsyncMock(side_effect=discord.PrivilegedIntentsRequired())
+
+        asyncio.run(endpoint._bot_runner())
+
+        assert endpoint._fatal_error.startswith('Discord Bot: enable the Server Members Intent')
+        assert 'Message Content' in endpoint._fatal_error  # still named, as also required
 
     def test_unexpected_close_is_terminal(self):
         endpoint = self._runner_endpoint()
@@ -2614,6 +2645,30 @@ class TestConfigCoercion:
     def test_bare_string_is_single_element_not_per_character(self):
         assert IEndpoint._as_str_list('123456') == ['123456']
 
+    def test_broken_json_is_reported_with_the_field_name(self):
+        # Live F38: '["123"' became the literal id '["123"' and the allowlist
+        # rejected everyone, with nothing in the task's warnings.
+        with mock.patch.object(_ENDPOINT_MODULE, '_config_warning') as warn:
+            assert IEndpoint._as_str_list('["123"', field='allowedBotIds') == ['["123"']
+        warn.assert_called_once()
+        assert 'allowedBotIds' in warn.call_args.args[0]
+        assert 'not valid JSON' in warn.call_args.args[0]
+
+    def test_valid_values_raise_no_warning(self):
+        with mock.patch.object(_ENDPOINT_MODULE, '_config_warning') as warn:
+            IEndpoint._as_str_list('["1", "2"]', field='channelIds')
+            IEndpoint._as_str_list(['["1"]'], field='channelIds')
+            IEndpoint._as_str_list('1, 2', field='channelIds')
+            IEndpoint._as_str_list(['1', 2], field='channelIds')
+        warn.assert_not_called()
+
+    def test_only_a_broken_guild_or_channel_list_is_fatal(self):
+        assert 'channelIds is not valid JSON' in IEndpoint._list_config_error({'channelIds': '["1"'})
+        assert 'guildIds is not valid JSON' in IEndpoint._list_config_error({'guildIds': ['["1",']})
+        assert IEndpoint._list_config_error({'channelIds': '["1"]', 'guildIds': '2'}) is None
+        # Other lists keep the warning only: a broken allowlist must not stop the bot.
+        assert IEndpoint._list_config_error({'allowedBotIds': '["1"'}) is None
+
 
 class TestOptionalTyping:
     """The pipeline awaitable runs exactly once regardless of typing errors."""
@@ -2827,3 +2882,67 @@ class TestOnMessageGating:
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+class TestPipelineTimeout:
+    """pipelineTimeoutSeconds: opt-in give-up on a pipeline that does not answer."""
+
+    @staticmethod
+    def _endpoint(seconds, delay):
+        endpoint = _make_endpoint()
+        endpoint._pipeline_timeout_seconds = seconds
+        endpoint._emit_no_reply = True
+        endpoint._emit_no_reply_event = mock.AsyncMock()
+        endpoint._run_with_optional_typing = IEndpoint._run_with_optional_typing.__get__(endpoint)
+
+        def slow(*args, **kwargs):
+            time.sleep(delay)
+            return 'late answer'
+
+        endpoint._run_text_pipeline = mock.Mock(side_effect=slow)
+        return endpoint
+
+    def test_off_by_default(self):
+        assert IEndpoint._pipeline_timeout_seconds == 0
+
+    def test_off_waits_for_a_slow_answer(self):
+        endpoint = self._endpoint(0, 0.3)
+
+        asyncio.run(endpoint._process_message(_make_message(content='q')))
+
+        assert _sent_reply(endpoint) == 'late answer'
+        endpoint._emit_no_reply_event.assert_not_awaited()
+
+    def test_an_answer_inside_the_limit_is_posted(self):
+        endpoint = self._endpoint(5, 0.1)
+
+        asyncio.run(endpoint._process_message(_make_message(content='q')))
+
+        assert _sent_reply(endpoint) == 'late answer'
+
+    def test_a_slow_pipeline_is_given_up_with_timeout(self):
+        endpoint = self._endpoint(0.2, 0.8)
+
+        asyncio.run(endpoint._process_message(_make_message(content='q')))
+
+        assert endpoint._send_response.await_count == 0, 'the late answer must be dropped'
+        assert endpoint._emit_no_reply_event.await_args.args[1] == 'timeout'
+
+    def test_an_attachment_timeout_is_not_swallowed(self):
+        endpoint = _make_endpoint()
+        endpoint._process_attachment = IEndpoint._process_attachment.__get__(endpoint)
+        endpoint._max_attachment_bytes = 10_000
+        endpoint._run_with_optional_typing = mock.AsyncMock(side_effect=_ENDPOINT_MODULE.PipelineTimeout('timeout'))
+        attachment = _attachment('a.png', b'png', content_type='image/png')
+
+        with pytest.raises(_ENDPOINT_MODULE.PipelineTimeout):
+            asyncio.run(endpoint._process_attachment(_make_message(), attachment, {}, 0))
+
+    def test_services_json_declares_the_field_off(self):
+        with open(_SERVICES_JSON, 'r', encoding='utf-8') as handle:
+            schema = json.load(handle)
+
+        field = schema['fields']['discord.pipelineTimeoutSeconds']
+        assert field['default'] == 0
+        assert field['minimum'] == 0
+        assert 'discord.pipelineTimeoutSeconds' in schema['fields']['Pipe.source.parameters']['properties']

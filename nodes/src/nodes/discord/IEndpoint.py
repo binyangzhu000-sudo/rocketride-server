@@ -49,7 +49,7 @@ depends(requirements)
 import discord
 from discord.ext import commands
 
-from .capture import CaptureWriter, capture_row, is_valid_source_label
+from .capture import CaptureWriter, _engine_warning, capture_row, is_valid_source_label
 from .text_utils import (
     attachment_kind,
     chunk_message,
@@ -81,6 +81,38 @@ THREAD_ARCHIVE_DURATIONS = (60, 1440, 4320, 10080)
 # are built from an exception message. Clipped here, at the one place every
 # reason passes through, so a runaway string cannot reach the key.
 MAX_NO_REPLY_REASON_CHARS = 200
+
+
+class PipelineTimeout(Exception):
+    """A pipeline run took longer than ``pipelineTimeoutSeconds``."""
+
+
+# A ``${NAME}`` the engine could not resolve reaches the node as literal text.
+_UNRESOLVED_VARIABLE = re.compile(r'^\$\{([A-Za-z0-9_]+)\}$')
+
+
+def _config_warning(message: str) -> None:
+    """Report a configuration problem where an operator looks: the task's warnings."""
+    debug(message)
+    _engine_warning(message)
+
+
+def _broken_json_text(value: Any) -> Optional[str]:
+    """The first item of a list setting that looks like JSON but does not parse."""
+    if not value:
+        return None
+    items = list(value) if isinstance(value, (list, tuple)) else [value]
+    for item in items:
+        if item is None or isinstance(item, (int, float)):
+            continue
+        text = str(item).strip()
+        if not text.startswith('['):
+            continue
+        try:
+            json.loads(text)
+        except ValueError:
+            return text
+    return None
 
 
 class IEndpoint(IEndpointBase):
@@ -150,6 +182,8 @@ class IEndpoint(IEndpointBase):
     _feedback_emojis: List[str]
     _sanitize_replies: bool = False
     _non_answer_retries: int = 1
+    _pipeline_timeout_seconds: float = 0
+    _config_error: Optional[str] = None
     # Escalation-pause state for this process: threads gone quiet until the bot
     # is @mentioned again, and threads whose state was already reconciled with
     # Discord history. Per-instance (created in _pause_state / _startup).
@@ -213,7 +247,7 @@ class IEndpoint(IEndpointBase):
         self._run()
 
     @staticmethod
-    def _as_str_list(value: Any, split: bool = True) -> List[str]:
+    def _as_str_list(value: Any, split: bool = True, field: str = '') -> List[str]:
         """Coerce a config value into a list of strings.
 
         Guards against a bare string (which would otherwise iterate into a
@@ -226,6 +260,8 @@ class IEndpoint(IEndpointBase):
                 whitespace. Right for ids and extensions; wrong for phrases
                 such as escalation markers, which pass ``split=False`` so
                 "Escalated to the RocketRide team." stays one marker.
+            field (str): The setting's name, for the warning a value that
+                looks like JSON but does not parse produces.
 
         Returns:
             List[str]: The strings, or an empty list.
@@ -255,6 +291,12 @@ class IEndpoint(IEndpointBase):
                     parsed = json.loads(text)
                 except ValueError:
                     parsed = None
+                    # Read as plain text below, which matches nothing it was
+                    # meant to: say so, or an allowlist silently rejects all.
+                    _config_warning(
+                        f'Discord: {field or "a list setting"} is not valid JSON ({text[:80]!r}); '
+                        f'it is read as plain text. Fix the setting.'
+                    )
                 if isinstance(parsed, list):
                     out.extend(str(v) for v in parsed if str(v).strip())
                     continue
@@ -263,6 +305,19 @@ class IEndpoint(IEndpointBase):
             else:
                 out.append(text)
         return out
+
+    @staticmethod
+    def _list_config_error(config: Dict[str, Any]) -> Optional[str]:
+        """A fatal problem in the guild or channel allowlist, else None.
+
+        Broken JSON in either leaves the bot connected but answering nothing,
+        so the start fails with the reason. Other lists only warn.
+        """
+        for field in ('guildIds', 'channelIds'):
+            text = _broken_json_text(config.get(field))
+            if text is not None:
+                return f'Discord Bot: {field} is not valid JSON ({text[:80]!r}); fix the setting'
+        return None
 
     @staticmethod
     def _as_int(value: Any, default: int) -> int:
@@ -303,7 +358,7 @@ class IEndpoint(IEndpointBase):
             List[str]: The digit-only ids, in configured order.
         """
         ids: List[str] = []
-        for item in cls._as_str_list(value):
+        for item in cls._as_str_list(value, field=field):
             if item.isdigit():
                 ids.append(item)
             else:
@@ -329,10 +384,13 @@ class IEndpoint(IEndpointBase):
         """
         config = self._get_discord_config()
         self._bot_token = config.get('botToken', '')
-        self._guild_ids = self._as_str_list(config.get('guildIds'))
-        self._channel_ids = self._as_str_list(config.get('channelIds'))
-        self._require_mention_channel_ids = self._as_str_list(config.get('requireMentionChannelIds'))
-        self._allowed_bot_ids = self._as_str_list(config.get('allowedBotIds'))
+        self._guild_ids = self._as_str_list(config.get('guildIds'), field='guildIds')
+        self._channel_ids = self._as_str_list(config.get('channelIds'), field='channelIds')
+        self._require_mention_channel_ids = self._as_str_list(
+            config.get('requireMentionChannelIds'), field='requireMentionChannelIds'
+        )
+        self._allowed_bot_ids = self._as_str_list(config.get('allowedBotIds'), field='allowedBotIds')
+        self._config_error = self._list_config_error(config)
         # Mention allowlists are the one config the outbound path cannot
         # tolerate garbage in, so a non-numeric entry is dropped here.
         self._allowed_mention_role_ids = self._snowflake_ids(
@@ -354,7 +412,8 @@ class IEndpoint(IEndpointBase):
         self._thread_auto_archive_minutes = self._as_int(config.get('threadAutoArchiveMinutes'), 0)
         self._number_chunks = config.get('numberChunks', False)
         self._text_attachment_extensions = [
-            value.lower() for value in self._as_str_list(config.get('textAttachmentExtensions', []))
+            value.lower()
+            for value in self._as_str_list(config.get('textAttachmentExtensions', []), field='textAttachmentExtensions')
         ]
         self._text_attachment_max_chars = self._as_int(config.get('textAttachmentMaxChars'), 12000)
         self._merge_attachments = config.get('mergeAttachments', False)
@@ -372,20 +431,29 @@ class IEndpoint(IEndpointBase):
         self._thread_history_limit = self._as_int(config.get('threadHistoryLimit'), 0)
         self._thread_history_max_chars = self._as_int(config.get('threadHistoryMaxChars'), 6000)
         self._escalation_pause = config.get('escalationPause', False)
-        self._escalation_markers = self._as_str_list(config.get('escalationMarkers'), split=False)
+        self._escalation_markers = self._as_str_list(
+            config.get('escalationMarkers'), split=False, field='escalationMarkers'
+        )
         # Engine-provided strings may be proxies; this one becomes a regex.
         self._team_mention_alias = str(config.get('teamMentionAlias', '') or '')
         self._ignore_aimed_at_others = config.get('ignoreAimedAtOthers', False)
         # Engine-provided strings may be proxies; discord.py needs a real str.
         self._ack_emoji = str(config.get('ackEmoji', '') or '')
         self._feedback_reactions = config.get('feedbackReactions', False)
-        self._feedback_emojis = self._as_str_list(config.get('feedbackEmojis', ['✅', '❌']), split=False)
+        self._feedback_emojis = self._as_str_list(
+            config.get('feedbackEmojis', ['✅', '❌']), split=False, field='feedbackEmojis'
+        )
         self._sanitize_replies = config.get('sanitizeReplies', False)
         # Clamped to the schema's 0..3; a malformed value falls back to the default.
         try:
             self._non_answer_retries = max(0, min(3, int(config.get('nonAnswerRetries', 1))))
         except (TypeError, ValueError):
             self._non_answer_retries = 1
+        # Off (0) unless set: a pipeline is otherwise waited for as long as it takes.
+        try:
+            self._pipeline_timeout_seconds = max(0.0, float(str(config.get('pipelineTimeoutSeconds') or 0)))
+        except (TypeError, ValueError):
+            self._pipeline_timeout_seconds = 0
         self._paused_threads = set()
         self._resolved_threads = set()
         debug(f'Discord _run: token_present={bool(self._bot_token)} reply_mode={self._reply_mode!r}')
@@ -466,6 +534,19 @@ class IEndpoint(IEndpointBase):
             monitorStatus('Discord Bot: missing bot token')
             raise RuntimeError('Discord Bot: missing bot token')
 
+        unresolved = _UNRESOLVED_VARIABLE.match(str(self._bot_token).strip())
+        if unresolved:
+            # The engine passes an unknown ${NAME} through as text; Discord would
+            # only say "invalid token", which points at the wrong fix.
+            message = f'Discord Bot: the bot token variable {unresolved.group(1)} is not set on this server'
+            monitorStatus(message)
+            raise RuntimeError(message)
+
+        config_error = getattr(self, '_config_error', None)
+        if config_error:
+            monitorStatus(config_error)
+            raise RuntimeError(config_error)
+
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
@@ -526,10 +607,16 @@ class IEndpoint(IEndpointBase):
         except discord.LoginFailure:
             self._fail('Discord Bot: login failed (invalid token)')
         except discord.PrivilegedIntentsRequired:
-            intents = ['Message Content']
+            # discord.py does not say which intent was refused. Message Content
+            # is always requested, so with member metadata on the likely missing
+            # one is Server Members: lead with it.
             if getattr(self, '_include_member_metadata', False):
-                intents.append('Server Members')
-            self._fail(f'Discord Bot: enable the {" and ".join(intents)} Intent in the Developer Portal')
+                self._fail(
+                    'Discord Bot: enable the Server Members Intent in the Developer Portal '
+                    '(the Message Content Intent is required too)'
+                )
+            else:
+                self._fail('Discord Bot: enable the Message Content Intent in the Developer Portal')
         except Exception as e:
             debug(f'Discord _bot_runner: EXCEPTION {e}')
             self._fail(f'Discord Bot: gateway error - {e}')
@@ -1355,6 +1442,9 @@ class IEndpoint(IEndpointBase):
                 )
             elif not reply and getattr(self, '_emit_no_reply', False):
                 await self._emit_no_reply_event(metadata, processing_errors[0] if processing_errors else 'no_answer')
+        except PipelineTimeout as e:
+            debug(f'Discord: {e} for {message.id}; its late answer will be dropped')
+            await self._emit_no_reply_event(metadata, 'timeout')
         except Exception as e:
             debug(f'Discord _process_message: EXCEPTION {e}')
             if getattr(self, '_emit_no_reply', False):
@@ -1567,6 +1657,24 @@ class IEndpoint(IEndpointBase):
             return ''
         return fold_text_attachment(attachment.filename, decoded, getattr(self, '_text_attachment_max_chars', 12000))
 
+    async def _await_pipeline(self, coro_factory):
+        """Await one pipeline run, giving up after ``pipelineTimeoutSeconds`` when set.
+
+        The run itself cannot be cancelled (it is a worker thread): on timeout
+        it finishes in the background, returns its pipe, and its answer is
+        dropped because nothing awaits it any more.
+
+        Raises:
+            PipelineTimeout: The run did not answer within the limit.
+        """
+        seconds = getattr(self, '_pipeline_timeout_seconds', 0) or 0
+        if seconds <= 0:
+            return await coro_factory()
+        try:
+            return await asyncio.wait_for(coro_factory(), timeout=seconds)
+        except asyncio.TimeoutError:
+            raise PipelineTimeout(f'pipeline gave no answer within {seconds:g}s') from None
+
     async def _run_with_optional_typing(self, message: discord.Message, coro_factory):
         """Run an awaitable, optionally showing the Discord typing indicator.
 
@@ -1583,7 +1691,7 @@ class IEndpoint(IEndpointBase):
             Any: The awaited result.
         """
         if not self._show_typing:
-            return await coro_factory()
+            return await self._await_pipeline(coro_factory)
 
         typing_cm = None
         try:
@@ -1594,7 +1702,7 @@ class IEndpoint(IEndpointBase):
             typing_cm = None
 
         try:
-            return await coro_factory()
+            return await self._await_pipeline(coro_factory)
         finally:
             if typing_cm is not None:
                 try:
@@ -1659,6 +1767,8 @@ class IEndpoint(IEndpointBase):
                     meta,
                 ),
             )
+        except PipelineTimeout:
+            raise  # the whole message is given up, not just this attachment
         except Exception as e:
             debug(f'Discord: attachment {attachment.filename} error: {e}')
             if meta is not None:
