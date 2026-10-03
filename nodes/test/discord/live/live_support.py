@@ -792,6 +792,9 @@ ENGINE_CONFIG_KEYS = {
     'supportChannelId': '',
     'teamRoleId': '',
     'driverBotId': '',
+    # The bot under test (the identity behind the engine's token variable).
+    # Optional: the full engine suite needs it to @mention the bot.
+    'botUserId': '',
     'driverTokenEnvFile': '',
     'driverTokenEnvKey': '',
 }
@@ -1065,6 +1068,8 @@ class DriverBot:
         self._answers: List[discord.Message] = []
         self._threads: List[discord.Thread] = []
         self._last_post = 0.0
+        self._own_threads: List[discord.Thread] = []
+        self.typing: List[tuple] = []
         self.residue: List[str] = []
         self.deleted = 0
 
@@ -1080,6 +1085,11 @@ class DriverBot:
         @self.client.event
         async def on_ready():
             self._ready.set()
+
+        @self.client.event
+        async def on_typing(channel, user, when):
+            # Typing is how the node's showTyping is observed from outside.
+            self.typing.append((channel.id, getattr(user, 'id', None), time.time()))
 
         future = asyncio.run_coroutine_threadsafe(self.client.start(load_driver_token(self.config)), self.loop)
         deadline = time.time() + 60
@@ -1120,16 +1130,67 @@ class DriverBot:
         return self.client.get_channel(channel_id) or self.run(self.client.fetch_channel(channel_id))
 
     # -- posting / reading --------------------------------------------------
-    def post(self, text: str, channel=None) -> discord.Message:
-        """Post one driver message, throttled so the pipeline is never raced."""
+    def post(
+        self,
+        text: Optional[str],
+        channel=None,
+        *,
+        files: Optional[List[discord.File]] = None,
+        embed: Optional[discord.Embed] = None,
+        reference: Optional[discord.Message] = None,
+        allowed_mentions: Optional[discord.AllowedMentions] = None,
+    ) -> discord.Message:
+        """Post one driver message, throttled so the pipeline is never raced.
+
+        Mentions are suppressed unless ``allowed_mentions`` says otherwise: the
+        test channel is visible to real people, and a test that puts
+        ``@everyone`` or the team role in its text must not ping anyone.
+        """
         target = channel if channel is not None else self.channel
         wait = E2E_POST_THROTTLE_SECONDS - (time.time() - self._last_post)
         if wait > 0:
             time.sleep(wait)
-        message = self.run(target.send(text))
+        kwargs: Dict[str, Any] = {
+            'allowed_mentions': allowed_mentions if allowed_mentions is not None else discord.AllowedMentions.none()
+        }
+        if files:
+            kwargs['files'] = files
+        if embed is not None:
+            kwargs['embed'] = embed
+        if reference is not None:
+            kwargs['reference'] = reference
+            kwargs['mention_author'] = False
+        message = self.run(target.send(text, **kwargs))
         self._last_post = time.time()
         self._posted.append(message)
         return message
+
+    def react(self, message: discord.Message, emoji: str, remove: bool = False):
+        if remove:
+            self.run(message.remove_reaction(emoji, self.client.user))
+        else:
+            self.run(message.add_reaction(emoji))
+
+    def delete(self, message: discord.Message):
+        self.run(message.delete())
+
+    def open_thread(self, name: str, message: Optional[discord.Message] = None, minutes: int = 60):
+        """Create a thread as the driver (on ``message``, or a bare channel thread)."""
+        if message is not None:
+            thread = self.run(message.create_thread(name=name, auto_archive_duration=minutes))
+        else:
+            thread = self.run(
+                self.channel.create_thread(
+                    name=name, type=discord.ChannelType.public_thread, auto_archive_duration=minutes
+                )
+            )
+        self._own_threads.append(thread)
+        return thread
+
+    def typing_by(self, user_id: int, channel_id: int, since: float) -> List[tuple]:
+        return [
+            entry for entry in list(self.typing) if entry[1] == user_id and entry[0] == channel_id and entry[2] >= since
+        ]
 
     def refetch(self, message: discord.Message) -> discord.Message:
         return self.run(message.channel.fetch_message(message.id))
@@ -1200,6 +1261,12 @@ class DriverBot:
             return deleted
 
         async def _archive():
+            for thread in self._own_threads:
+                try:
+                    await thread.edit(archived=True)
+                    residue.append(f'archived driver thread {thread.name!r} ({thread.id})')
+                except Exception as error:
+                    residue.append(f'driver thread {thread.name!r} ({thread.id}) not archived: {type(error).__name__}')
             for thread in self._threads:
                 try:
                     await thread.edit(archived=True)

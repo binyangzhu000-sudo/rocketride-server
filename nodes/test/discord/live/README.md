@@ -14,6 +14,7 @@ Layer map (from `.context/discord-test-plan.md`):
 | L1 live I/O | `test_live_io.py` (D01..D19) | bot token + Discord reachable | running |
 | L2 replay | `test_replay.py` (R01..R10) | same | running (plumbing only) |
 | L3 engine e2e | `test_engine_e2e.py` (E01..E06) | engine on `ROCKETRIDE_URI` + a driver bot | running (E06 pending) |
+| L4 full engine suite | `test_engine_full.py` (F01..F46) | L3 + `DISCORD_E2E_FULL=1` + `botUserId` | running (see "Full engine suite") |
 
 ## How to run
 
@@ -245,6 +246,10 @@ questions in flight.
 - `replay_seeds.md` — vendored copy of `eval/replay-seeds.md` from the reference
   bot repo (read-only; re-copy it if the upstream regression set changes).
 - `test_engine_e2e.py` — E01..E06 against a real engine and a driver bot.
+- `test_engine_full.py` — F01..F46: every node feature through real pipelines on
+  the engine (deterministic echo and fake-model pipes, one real AI run).
+- `fake_llm.py` — a scripted OpenAI-compatible endpoint for `llm_openai_api`
+  (scratchpad, `{"type":"final"}`, error text, empty, retry, HTTP 429, slow).
 - `engine_min.pipe` — the pipe those tests run: discord -> prompt -> OpenAI ->
   answers, with `${ROCKETRIDE_*}` placeholders the **engine** resolves. It is a
   copy of `apps/discordDashboard/src/pipelines/discord-support-min.pipe` with
@@ -397,4 +402,155 @@ Other pipelines use `tool_slack`, `db_postgres`, `rocketride_sql` and `packages/
 | Container restarted | The next question and reply were captured (seq 324–325); engine warning "writes to capture_db recovered after 2 failures". The 2 outage rows were not written, by design; the log import can fill them. |
 
 Checks: discord node tests 245 passed / 1 skipped (new cases for `captureSource`: label recorded verbatim, invalid labels fall back, validation table, services.json field); `ruff check` and `ruff format --check` clean; `validate-node-readme.py` PASS for discord and for every node; `validate-client-docs.py` ok; the app's self-tests (replayCopy, rules, db incl. 4 new page-inference cases) report 0 failures; `tsc --noEmit` clean.
+
+## Full engine suite (2026-10-03, L4)
+
+Every current node feature, success and failure, through real pipelines on the
+local engine (bundled engine on :5566, with this branch's node copied into its
+`nodes/discord` and the engine restarted). Driven by Rocket Relay, one message
+at a time, in the support channel only (a private channel; mentions in driver
+posts are suppressed). Ralph's bot task was stopped from the dashboard first
+(engine state 6) and restarted from the dashboard afterwards.
+
+```bash
+DISCORD_LIVE=1 DISCORD_E2E_FULL=1 ROCKETRIDE_URI=http://localhost:5566 \
+DISCORD_E2E_PG_CONTAINER=rr-discord-pg DISCORD_E2E_PG_HOST=127.0.0.1:55432 \
+DISCORD_E2E_PG_USER=rr_discord DISCORD_E2E_PG_DATABASE=discord_e2e \
+DISCORD_E2E_ENGINE_DIR=<engine folder> DISCORD_E2E_ENGINE_LOG=<engine log> \
+DISCORD_E2E_RALPH_PIPE=<saved copy of Ralph's pipe> \
+  python3 -m pytest nodes/test/discord/live/test_engine_full.py \
+  --confcutdir=nodes/test/discord/live -s -v -p no:cacheprovider
+```
+
+`--confcutdir` keeps pytest from loading `nodes/test/conftest.py`, which needs
+the engine's `ai` package. The engine id block needs `botUserId` (the bot
+under test). Results are appended to `.context/e2e-full/<stamp>.jsonl`, and the
+fake model's request log to `<stamp>-fake-calls.json`.
+
+**Pipes.** Node behaviour runs on deterministic pipes: `echo` (discord ->
+`response_text` keyed `answers`, so the answer is the text the node sent,
+including thread context and merged files) and `fake` (discord -> prompt ->
+`llm_openai_api` pointed at `fake_llm.py`). Capture writes to an isolated
+database (`discord_e2e`), never the dashboard's. F46 runs Ralph's production
+pipe once with `tool_slack`, the Slack rule and capture removed.
+
+**Channel without permission.** The bot under test is not a member of the
+guild that holds `#test`, so `#test` serves only as the unreadable backfill
+channel (F35). Thread refusal (F42) is produced in the support channel by the
+driver taking the message's one thread first; a failed post (F43) by deleting
+the question while the pipeline runs.
+
+### Result matrix
+
+44 of 44 rows pass. Wall time about 25 minutes for the full file. Rows
+F12, F36, F38, F38b, F39, F40, F41b and F44 come from the 2026-10-03 rerun
+against the fixed node (N1..N7 below); F04, F20, F35 and F45 from reruns after
+test fixes (listed under "Test fixes"); every other row from the first full run.
+
+| ID | Feature | Case | Expected | Actual | Result | Evidence |
+|---|---|---|---|---|---|---|
+| F01 | replyMode | channel | plain channel message, no reply reference, outbound destination=channel | answer=<id> reference=None destination=channel | PASS | outbound messageIds=['<id>'] |
+| F02 | replyMode | reply | native reply to the question, author not pinged, destination=reply | reference=<id> posted=<id> mentions=[] | PASS | destination=reply |
+| F03 | replyMode / thread naming | thread mode, template "Q: {content}", max length 25 (cut on a space) | thread 'Q: [e2e F03] thread name', answer inside, destination=thread | thread='Q: [e2e F03] thread name' answer_in_thread=True destination=thread | PASS | thread <id> |
+| F04 | thread naming | attachment-only message (no text) | thread named after the first attachment (notes.md) | thread='notes.md' | PASS | posted <id> |
+| F05 | threadAutoArchiveMinutes | 60 (valid) and 61 (invalid) | 60 -> thread archives after 60; 61 -> channel default used, answer still posted | 60 -> duration 60, answered True; 61 -> duration 1440, answered True | PASS | thread.auto_archive_duration read back by the driver |
+| F06 | requireMention | global: without and with a bot mention | ignored (no event) without the mention; answered with it | without: posts=0 message_event=False; with: answered=True | PASS | questions <id>, <id> |
+| F07 | requireMentionChannelIds | support channel listed: plain, mentioned, thread follow-up without mention | plain ignored; mentioned answered; follow-up in its thread ignored (parent rule applies) | plain posts=0; mentioned answered=True; follow-up posts=0 | PASS | thread <id> |
+| F08 | guildIds / channelIds | support channel outside the guild allowlist; outside the channel allowlist | both ignored: no post, no message event | other guild: posts=0 event=False; other channel: posts=0 event=False | PASS | allowlisted case is every other test |
+| F09 | ignoreBots / allowedBotIds | driver bot not allowlisted; ignoreBots off; allowlisted | ignored; answered; answered | ignoreBots on, driver not allowlisted: answered=False; ignoreBots off: answered=True; ignoreBots on, driver allowlisted: answered=True | PASS | driver is a bot account |
+| F10 | showTyping | on and off around a 6 s pipeline | typing event(s) from the bot when on, none when off; answered both times | showTyping=True: typing events=2, answered=True; showTyping=False: typing events=0, answered=True | PASS | driver on_typing gateway events |
+| F11 | sendResponses | off (listen only) | message ingested, nothing posted, outbound destination=suppressed with the answer text | posts=0 message_event=True destination=suppressed | PASS | outbound text='[e2e F11] listen only\n\n' |
+| F12 | long answer split / numberChunks | ~5.5k-char answer, numberChunks off then on | chunks <= 2000 chars, whole lines, in order; no labels when off; *(i/n)* labels 1..n when on | off: 3 chunks, max 1995, ordered True, labels 0; on: 3 chunks, max 1982, ordered True, labels ['1/3', '2/3', '3/3'] | PASS | reassembled from the thread; boundaries cut mid-line inside the code fence: off 0, on 0; last chunk ends 'x\n```\n\n*(3/3)*' |
+| F13 | allowedMention* | answer containing @everyone, the team role and the driver user; only the driver allowlisted | only the allowlisted user is pinged; @everyone and the role stay inert text | mention_everyone=False role_mentions=[] user_mentions=[driver] | PASS | team role deliberately not allowlisted (it would ping real people) |
+| F14 | teamMentionAlias | answer containing the literal alias | alias rewritten to the first allowlisted role mention | answer has role mention=True, literal alias left=False | PASS | answer <id> (fake role id, nobody pinged) |
+| F15 | attachments: image, audio, video, text | png + wav + mp4 + .md with text, mergeAttachments off | image/audio/video on their binary lanes; .md framed as text; reply is the text answer only | binary lanes=['image/png', 'audio/wav', 'video/mp4']; md framed=True; reply has file body=False | PASS | 2 text object(s), 3 binary object(s) |
+| F16 | mergeAttachments | on: text + .md in one message | ONE text pass containing the question and the file; answer shows both | answer has file body=True; text passes=1 | PASS | answer <id> |
+| F17 | textAttachmentExtensions | empty list (default): .md attachment | .md is NOT read as text; it travels as a binary object | answer has file body=False; binary lanes=['text/markdown'] | PASS | answer <id> |
+| F18 | maxAttachmentBytes | 1 KB .bin over a 600-byte limit + a small png | oversized file skipped (never opened, not counted); png still routed; text answered | binary lanes=['image/png']; groupSize=[2]; answered=True | PASS | 2 message event(s) |
+| F19 | unsupported attachment type | .bin only (application/octet-stream) | routed to the tag stream, no crash, nothing posted, no_reply reason no_answer | binary lanes=['application/octet-stream']; posts=0; no_reply=no_answer | PASS | [e2e F19] attachment-only message <id> |
+| F20 | threadHistoryLimit / threadHistoryMaxChars | thread: opening, two follow-ups (limit 2); then a follow-up with an 80-char cap | follow-ups carry earlier turns; only the last 2 messages at limit 2; cap keeps the newest 80 chars behind an ellipsis; SSE text is the user's own words | 1st follow-up saw the opening=True; 2nd follow-up entries=2 saw the opening=False; capped transcript 82 chars, ellipsis=True, contextChars=82 | PASS | transcripts read from the fake model's request log; thread <id> |
+| F21 | escalationPause / markers / resume / team reply | escalating answer, silent follow-up, team reply, @mention, plain follow-up | paused after the marker; silent and team replies -> no_reply paused (team text on the event); @mention answered and unpauses | silent=paused posts=0; team=paused text_on_event=True; mention answered=True; after resume answered=True | PASS | thread <id> |
+| F22 | escalationPause | pipeline restarted while the thread is escalated | pause rebuilt from thread history: follow-up gets no_reply paused, nothing posted | posts=0 no_reply=paused | PASS | thread <id> |
+| F23 | ignoreAimedAtOthers / ackEmoji | message mentioning another user; reply to a non-bot message | acknowledged with the emoji only: nothing posted, no_reply aimed_elsewhere (both) | mention: posts=0 reactions=['👀'] reason=aimed_elsewhere; reply: posts=0 reason=aimed_elsewhere | PASS | question <id> |
+| F24 | feedbackReactions / emitReactions | bot adds feedback emoji; driver adds then removes a reaction | bot adds the emoji (not emitted as events); driver add and remove each emit a reaction event | bot reactions=['✅', '❌']; outbound.feedbackEmojis=['✅', '❌']; events before driver=0; add event=True; remove events=1 | PASS | answer <id> |
+| F25 | sanitizeReplies | {"type":"final"} envelope, scratchpad, a 429 error as the answer text, empty answer | envelope unwrapped and posted; scratchpad retried then dropped (non_answer); error text dropped (model_error); empty -> no_answer | final: ok (posted unwrapped); scratchpad: ok (calls=2); 429 text: ok (model_error); empty: ok (calls=4) | PASS | fake model; posted envelope answer <id>; error text was "Error code: 429 - {'error': {'"... |
+| F26 | nonAnswerRetries | scratchpad first, real answer second; retries 1 then 0 | retries=1: second call answers and is posted (message event retry=1); retries=0: one call, non_answer | retries=1: answered=True calls=2 retry_events=1 no_reply=<no no_reply event>; retries=0: answered=False calls=1 retry_events=0 no_reply=non_answer | PASS | fake model call log |
+| F27 | system / empty messages | "started a thread" system notice and an embed-only message (no text, no file) | both ignored: no message event, nothing posted | embed-only message events=0; posts=0; driver message events in window=0 | PASS | driver thread <id> |
+| F32 | captureEvents / captureSource / default table | question, answer and a reaction with capture on and no captureTable set | table discord_events created by default; message, outbound, reaction rows with source e2e:full | discord_events exists=t; rows=['message:e2e:full', 'outbound:e2e:full', 'reaction:e2e:full'] | PASS | database discord_e2e |
+| F33 | capture dedupe | the same message emitted twice (backfill after a restart) | second message event emitted but not stored again (ON CONFLICT DO NOTHING) | rows before=1; re-emitted events=1; rows after=1 | PASS | message <id> |
+| F34 | capture: database down mid-run | container stopped, question, container started, question | answered while down (capture write logged and dropped); next question captured again | answered while down=True; rows for outage question=0; answered after=True; rows after=2 | PASS | log: failed=[] recovered=[] |
+| F35 | backfillLimit | limit 2 over the support channel plus a channel the bot cannot read | the 2 newest support messages replayed oldest first; unreadable channel skipped; task keeps running | replayed=['seed1', 'seed2']; running=True | PASS | log: [] |
+| F36 | includeMemberMetadata | on, on a bot whose Server Members intent may be off | either runs with member metadata, or fails fast leading with the Server Members intent | logged in=False; names Server Members=True; state=5 | PASS | status='Completed' errors=['Exception*Scanning path failed / : Exception  (ap:0x13) … |
+| F37 | config coercion | numbers as strings, a bare-string id, a JSON-text channel list | all honoured: name <= 20, archive 60, driver allowed, channel matched | thread='[e2e F37] numbers as' archive=60 answered=True | PASS | thread <id> |
+| F38 | config coercion | allowedBotIds given as broken JSON text | no crash; the driver is not allowed; the task warnings name the setting | running=True; answered=False; warnings naming allowedBotIds=1 | PASS | task warning: ['lowedBotIds is not valid JSON (\'["<id>"\'); it is read as plain text. Fix the setting.… |
+| F38b | config coercion | channelIds given as broken JSON text | the start fails with a message naming channelIds (a bot that answers nothing is not left running) | logged in=False; state=5 | PASS | task error='Ride/engine/nodes/discord/IEndpoint.py:548 Message: Discord Bot: channelIds is not valid JSON (\'["<id>"\'); fix the setting*scan.cpp:303' |
+| F39 | botToken | missing variable; invalid token | missing: fails naming the unset variable; invalid: "login failed (invalid token)"; engine keeps serving | missing variable: state=5 status='Completed' task error='e/engine/nodes/discord/IEndpoint.py:543 Message: Discord Bot: the bot token variable ROCKETRIDE_DISCORD_E2E_NO_SUCH_TOKEN is not set on this server*scan.cpp:303'; invalid token: state=5 status='Complete… | PASS | engine reachable afterwards=True |
+| F40 | pipeline throws | model endpoint returns HTTP 429 on every call | nothing posted (no raw error); no_reply model_error; the next question is answered | replies posted=[]; no_reply after 3s='model_error'; outbound=None; model calls=6; next answered=True | PASS | question <id> |
+| F41 | pipeline times out | model takes 90 s; a second question meanwhile | no node-side timeout exists: the slow answer arrives late; the other question is not blocked | quick answered in 4s (True); slow answered=True after 92s; no_reply=<no no_reply event> | PASS | the node has no pipeline timeout setting; the model client timed out or not as shown |
+| F41b | pipelineTimeoutSeconds | limit 15 s, model takes 45 s | no_reply timeout after ~15 s; the late answer is dropped, nothing posted | no_reply=timeout after 15s; late answer posted=False | PASS | fake model |
+| F42 | thread creation refused | the question already has a thread (created by the driver first) | create_thread fails; the answer is posted as a reply in the channel (destination=reply) | answered in channel=True; destination=reply; posts in the taken thread=0 | PASS | the bot under test is not in the guild that holds #test, so the refusal is produced in the support channel |
+| F43 | send failure | question deleted while the pipeline runs (reply target gone) | nothing posted; no_reply reason send_failed | no_reply=send_failed; posts=0 | PASS | question <id> (deleted) |
+| F44 | Discord rate limit | ~20k-char answer posted as many chunks in a burst | every chunk lands, whole lines, in order, nothing dropped; discord.py waits out the 429s | chunks=11; all lines in order=True; largest gap=4.94s; span=7.7s | PASS | gaps between chunks=[0.32, 0.34, 0.26, 0.17, 0.29, 4.94, 0.32, 0.24, 0.39, 0.45]; mid-line cuts=0; log lines mentioning rate limit=0 |
+| F45 | engine restart mid-thread | engine killed and restarted between turns of a thread; a message posted while it was down | after restart the thread is answered with the full history (incl. the message posted while down); the missed message is not answered on its own | answered=True; history has pre-restart turn=True, missed message=True; missed message answered on its own=False | PASS | thread <id>; port closed after 0s, discord task process gone after 5s |
+| F46 | AI path (Ralph pipe, no tool_slack, no capture) | one realistic support question | a sanitized model answer in a thread, with the feedback emoji | answered=True chars=1356 leaked scratchpad/error=False reactions=['✅', '❌'] chunks=1 no_reply= | PASS | first 100 chars: 'You can run a RocketRide pipeline from the Python SDK in just a few steps:\n\n1. **Install the SDK:**\n' |
+
+**Event coverage.** `outbound` destinations seen: `channel` (F01), `reply`
+(F02, F42), `thread` (F03), `suppressed` (F11). `no_reply` reasons seen:
+`paused` (F21, F22), `aimed_elsewhere` (F23), `model_error` (F25),
+`non_answer` (F25, F26), `no_answer` (F19, F25), `send_failed` (F43),
+`model_error` for a provider failure that arrives as answer text (F40, after
+N1), `timeout` (F41b). The pipeline-error reason (exception text) is not
+reachable with these pipes: the LLM layer reports a failure as answer text
+rather than raising. `reaction` add and remove (F24),
+`message` with `retry: 1` (F26), and `contextChars` (F20).
+
+### Node findings (all fixed 2026-10-03, tests first)
+
+| # | Severity | Found by | Finding | Fix | Verified live |
+|---|---|---|---|---|---|
+| N1 | high | F40 | With `sanitizeReplies` on, a model failure was posted to Discord: the engine's LLM layer turns the exception into the answer text `**LLM error** — ValueError: An error occurred with the API.`, and no error signature matched it. Same class as the 2026-10-02 incident. | Two signatures: the `**LLM error**` prefix at the start of the answer, and the bare `An error occurred with the API.` sentence when it is the whole answer (prose that mentions API errors is not matched). | F40: nothing posted, `no_reply` `model_error` after 3 s |
+| N2 | medium | F12, F44 | Inside a code fence the chunker cut mid-line (every boundary): a code line was split across two messages. | Break at the last newline in the second half of the window; the synthetic close/reopen fence pair stands in for that newline, so the text rebuilds exactly by replacing each `\n``````\n` with `\n`. | F12: 0 of 2 + 0 of 2 cuts; F44: 0 of 10 |
+| N3 | low | F12 | A numbered last chunk kept the answer's trailing blank lines before its label. | Strip each piece before the label. | F12: last chunk ends `` ``` `` then `*(3/3)*` |
+| N4 | medium | F38 | A list setting with broken JSON (`["123"`) became a literal id and the allowlist rejected everything, with no warning. | A task warning names the setting; broken JSON in `guildIds` or `channelIds` fails the start instead. | F38 warning; F38b start fails naming `channelIds` |
+| N5 | low | F39 | An unset token variable reached the node as `${NAME}` and was reported as "login failed (invalid token)". | An unresolved `${NAME}` fails the start: "the bot token variable NAME is not set on this server". | F39 |
+| N6 | medium | F41 | No pipeline timeout. | Opt-in `pipelineTimeoutSeconds` (default 0, off): `no_reply` `timeout`, late answer dropped. Each run (question, attachment, retry) gets the full limit. | F41b: `timeout` after 15 s, nothing posted at 45 s |
+| N7 | low | F36 | The members-intent failure led with Message Content, which was already on. | With member metadata on: "enable the Server Members Intent ... (the Message Content Intent is required too)". | F36 |
+
+### Observations (not node bugs)
+
+- **Engine shutdown order.** On SIGTERM the engine closes its port at once but
+  the discord task process keeps its Gateway session for about 5 s (F45). The
+  first F45 run posted a "while down" message inside that window and the old
+  process answered it. The test now waits for the task process to exit.
+- **Fatal source start reads as `Completed`.** A source that fails at start
+  (F36, F39) ends in state 5 with status "Completed"; the node's message is only
+  in `errors`, wrapped in "Scanning path failed ... scan.cpp".
+- **Node warnings are not in the engine's stdout log** (capture failed /
+  recovered); they surface in task status `warnings`. F34 is judged on the
+  database rows.
+- **Empty completions are retried below the node.** F25's empty answer made 4
+  model calls: the LLM layer repeats an empty completion once, and
+  `nonAnswerRetries` doubles that.
+- **Discord rate limit.** discord.py absorbs the 5-per-5-seconds channel limit
+  silently: F44's 11 chunks show one 4.8 s stall after the sixth message and no
+  error or retry in the node.
+
+### Test fixes during the run
+
+F04 (an attachment-only `.md` needs `textAttachmentExtensions` to be answered,
+else no thread is opened), F12/F44 (judge on the reassembled text; the mid-line
+cuts are N2), F20 (moved to the fake pipe: the echo pipe nests earlier answers,
+so the history limit could not be isolated), F35 (stop the previous pipe before
+posting the seeds, or their answers push a seed out of the backfill window),
+F40 (look for any reply to the question, not a tagged one), F45 (wait for the
+task process to exit, not just the port).
+
+### Residue
+
+Rocket Relay deleted its own messages (about 100 across both days, all of
+them) and archived its two threads. Left behind, because the driver cannot delete or archive another
+bot's messages: about 60 node answers in the support channel (including the
+three N1 error posts) and about 25 node-created threads, which auto-archive
+after 60 minutes (the post-check threads on Ralph's own pipe after 1440). The
+isolated `discord_e2e` database was dropped after the run.
 
