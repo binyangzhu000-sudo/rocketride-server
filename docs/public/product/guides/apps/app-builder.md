@@ -140,8 +140,10 @@ const { token } = await client.use({ pipeline: summarizer, useExisting: true });
 
 Every signed-in user gets their own instance. Start it once per session and
 keep the token; `useExisting: true` re-attaches after a reload instead of
-failing because the pipeline is already running. The pipeline ships with the
-app on deploy. Use this for work that happens when the user asks for it.
+failing because the pipeline is already running. To run two instances for the
+same user at once, give each `use()` its own unguessable `token` (keep the
+`tk_` prefix). The pipeline ships with the app on deploy. Use this for work
+that happens when the user asks for it.
 
 ### Outside the app: shared, on a schedule
 

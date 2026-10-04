@@ -317,7 +317,7 @@ Start a RocketRide pipeline for processing data.
 
 - `pipeline` (dict, optional): Flat pipeline configuration dict (`components`, `source`, `project_id` at top level). A dict wrapped as `{'pipeline': {...}}` is automatically unwrapped.
 - `filepath` (str, optional): Path to a `.pipe` or JSON/JSON5 file containing pipeline configuration. Files with a top-level `pipeline` key are automatically unwrapped.
-- `token` (str, optional): Custom token for the pipeline (auto-generated if not provided)
+- `token` (str, optional): Custom token for the pipeline (auto-generated if not provided). Pass a distinct token per instance to run the same pipeline more than once at a time; tokens share one namespace across users, so use an unguessable value that keeps the `tk_` prefix
 - `source` (str, optional): Override the pipeline source (which source component this task runs from)
 - `threads` (int, optional): Number of threads for execution (default: None, the server decides)
 - `use_existing` (bool, optional): Reuse an existing pipeline instance with the same identity

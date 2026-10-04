@@ -308,7 +308,7 @@ Start a RocketRide pipeline. Returns the server response body; `token` is the ta
 
 - `pipeline?: PipelineConfig` — flat pipeline object (`components`, `source`, `project_id` at top level — do **not** wrap it in `{ pipeline: { ... } }`)
 - `filepath?: string` — path to a `.pipe` or JSON file (Node.js only); `{ "pipeline": { ... } }` wrappers are unwrapped automatically
-- `token?: string` — custom task token (auto-generated if not provided)
+- `token?: string` — custom task token (auto-generated if not provided). Pass a distinct token per instance to run the same pipeline more than once at a time; tokens share one namespace across users, so use an unguessable value that keeps the `tk_` prefix
 - `source?: string` — override the pipeline's source component
 - `threads?: number` — number of execution threads. **No client default** — when omitted, the server decides
 - `useExisting?: boolean` — reuse an existing pipeline instance

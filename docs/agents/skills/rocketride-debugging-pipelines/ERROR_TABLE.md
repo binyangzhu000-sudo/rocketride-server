@@ -18,7 +18,7 @@ the row, route the fix.
 | validate error contains `references unknown component id` | a `source`/`input`/`control` entry names a component `id` that doesn't exist | designing | fix the component id in the wiring |
 | validate error contains `input has unknown lane` | output lane ≠ input lane on an edge (input names a lane the node doesn't provide) | designing | add a converter or pick compatible nodes |
 | `KeyError: '<key>'` | response key ≠ `laneName` | configuring/running | read `result_types`; use defaults or match client code |
-| `Pipeline is already running.` | `use()` called twice on same token | running | `use_existing=True`, or `terminate(token)` then `use()` |
+| `Pipeline is already running.` | a second `use()` for the same owner, `project_id` and source: without a custom `token` both runs hash to the same task | running | attach with `use_existing=True`, or `terminate(token)` then `use()`; to run several instances at once give each `use()` its own unguessable `tk_` token (SDK `use()` or `rocketride start --token`; the MCP `run_pipeline` tool has no token parameter) |
 | `Invalid API key` | wrong/missing key | configuring | set `${ROCKETRIDE_*}` env var correctly |
 | run/validate failure mentioning `project_id` (no single verbatim message) | variable used in `project_id` | configuring | use a literal GUID |
 | empty / wrong output, no error | wrong wiring or wrong input data | designing/data | trace the first node with empty output; check input + lanes |

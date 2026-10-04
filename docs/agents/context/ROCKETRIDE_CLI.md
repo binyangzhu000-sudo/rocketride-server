@@ -77,7 +77,7 @@ rocketride upload files/*.csv --token TASK_TOKEN           # upload into an alre
 rocketride stop --token TASK_TOKEN                         # terminate a task
 ```
 
-- `start` options: `--pipeline <file>` (or `ROCKETRIDE_PIPELINE`; required), `--token <token>` (or `ROCKETRIDE_TOKEN`), `--threads <num>` (default 4), `--args <args...>`
+- `start` options: `--pipeline <file>` (or `ROCKETRIDE_PIPELINE`; required), `--token <token>` (or `ROCKETRIDE_TOKEN`; your own unguessable `tk_` token also lets one pipe run twice at once), `--threads <num>` (default 4), `--args <args...>`
 - `upload` options: `--pipeline <file>` or `--token <token>` (one required), `--threads <num>` (default 4), `--max-concurrent <num>` (default 5), `--args <args...>`
 
 There is no live-monitor command: continuous monitoring belongs to the

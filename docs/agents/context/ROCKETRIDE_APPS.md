@@ -909,6 +909,20 @@ already-running instance (a reload, a second tab, a second component)
 instead of failing with 'Pipeline is already running.' — it never crosses
 user boundaries.
 
+To run two instances of one pipeline for the same user at once (a second
+tab, say), give each `use()` its own `token`: the server then keys the task
+on that token instead of the hash. Use an unguessable value that keeps the
+`tk_` prefix (`tk_` plus a UUID, for example): the value is the run's private
+token (full control for anyone who presents it), tokens share one namespace
+across every user of the server, and a token without the prefix cannot serve
+as a private token on webhook or dropper endpoints. Keep the tokens you
+chose: both instances get the same `pk_` public authorization key, and
+`getTaskToken()` is keyed by `projectId` and source, so each resolves to only
+one of the instances. Monitor subscriptions are keyed the same way: both
+instances' events arrive in one subscription, and a few minutes after one
+instance ends the shared subscription is dropped, so resubscribe. The run
+log is not built for two instances of one identity; treat it as unreliable.
+
 **Per-user tasks (the default, and the only behavior `use()` can produce):**
 
 - Isolation — whatever state the pipeline holds in memory (accumulated
