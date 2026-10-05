@@ -375,23 +375,70 @@ class TestAgeDataGaps:
         stored = _raw_cypher(age_graph, 'MATCH ()-[r:MENTORS]->() RETURN r.since', 'since agtype')
         assert stored == [(None,)]
 
+    def test_canary_age_drops_set_on_new_end_node_of_path_merge(self, rr_env, age_graph):
+        _raw_cypher(age_graph, "MERGE (a:Person {name:'erin'})-[:KNOWS]->(b:Person {name:'fay'}) SET b.age = 7")
+        stored = _raw_cypher(age_graph, "MATCH (b:Person {name:'fay'}) RETURN b.age", 'age agtype')
+        assert stored == [(None,)]
+
+    def test_canary_age_drops_remove_on_merged_relationship(self, rr_env, age_graph):
+        _raw_cypher(
+            age_graph,
+            "MATCH (a:Person {name:'alice'}), (c:Person {name:'carol'}) "
+            'MERGE (a)-[r:MENTORS {since: 2024}]->(c) REMOVE r.since',
+        )
+        stored = _raw_cypher(age_graph, 'MATCH ()-[r:MENTORS]->() RETURN r.since', 'since agtype')
+        assert stored == [('2024',)]
+
+    def test_canary_merge_with_other_pattern_properties_adds_an_edge(self, rr_env, age_graph):
+        # Why the rejection message leads with a separate SET call: MERGE
+        # matches on pattern properties, so new values mean a second edge.
+        _raw_cypher(
+            age_graph, "MATCH (a:Person {name:'alice'}), (b:Person {name:'bob'}) MERGE (a)-[:KNOWS {since: 2020}]->(b)"
+        )
+        count = _raw_cypher(
+            age_graph, "MATCH (:Person {name:'alice'})-[r:KNOWS]->(:Person {name:'bob'}) RETURN count(r)", 'n agtype'
+        )
+        assert count == [('2',)]
+
     def test_canary_age_matches_every_row_on_empty_in(self, rr_env, age_graph):
         rows = _raw_cypher(age_graph, 'MATCH (p:Person) WHERE p.name IN [] RETURN p.name', 'name agtype')
         assert len(rows) == 3
 
-    def test_merge_relationship_set_rejected_before_db(self, rr_env, age_graph):
+    @pytest.mark.parametrize(
+        'query',
+        [
+            "MATCH (a:Person {name:'alice'}), (c:Person {name:'carol'}) MERGE (a)-[r:MENTORS]->(c) SET r.since = 2024",
+            "MERGE (a:Person {name:'erin'})-[:MENTORS]->(b:Person {name:'fay'}) SET b.age = 7",
+            "MATCH (a:Person {name:'alice'}), (c:Person {name:'carol'}) "
+            'MERGE (a)-[r:MENTORS]->(c) WITH r AS e SET e.since = 2024',
+            "MATCH (a:Person {name:'alice'}), (c:Person {name:'carol'}) MERGE (a)-[r:MENTORS]->(c) SET (r).since = 2024",
+            "MATCH (a:Person {name:'alice'}), (c:Person {name:'carol'}) "
+            'MERGE (a)-[r:MENTORS {since: 2024}]->(c) REMOVE r.since',
+        ],
+    )
+    def test_write_after_relationship_merge_rejected_before_db(self, rr_env, age_graph, query):
         glb = _begin(rr_env, {'allow_execute': True})
         inst = rr_env.iinstance_cls()
         inst.IGlobal = glb
         try:
-            with pytest.raises(Exception, match='MERGE pattern'):
-                inst.execute(
-                    {
-                        'query': "MATCH (a:Person {name:'alice'}), (c:Person {name:'carol'}) "
-                        'MERGE (a)-[r:MENTORS]->(c) SET r.since = 2024'
-                    }
-                )
+            with pytest.raises(Exception, match='separate execute call'):
+                inst.execute({'query': query})
             assert _raw_cypher(age_graph, 'MATCH ()-[r:MENTORS]->() RETURN count(r)', 'n agtype') == [('0',)]
+        finally:
+            glb.endGlobal()
+
+    def test_set_on_variable_bound_before_merge_is_stored(self, rr_env, age_graph):
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = rr_env.iinstance_cls()
+        inst.IGlobal = glb
+        try:
+            inst.execute(
+                {
+                    'query': "MATCH (a:Person {name:'alice'}), (c:Person {name:'carol'}) "
+                    'MERGE (a)-[r:MENTORS]->(c) SET a.mentor = true'
+                }
+            )
+            assert glb._run_query("MATCH (a:Person {name:'alice'}) RETURN a.mentor AS m") == [{'m': True}]
         finally:
             glb.endGlobal()
 
@@ -418,6 +465,8 @@ class TestAgeDataGaps:
             ('NOT p.name IN []', ['alice', 'bob', 'carol']),
             ("p.name IN [] OR p.name = 'bob'", ['bob']),
             ("p.name IN [] AND p.name = 'bob'", []),
+            ('p.name IN [/*none*/]', []),
+            ('NOT p.name IN ([])', ['alice', 'bob', 'carol']),
         ],
     )
     def test_empty_list_in_returns_correct_rows(self, rr_env, age_graph, where, expected):
@@ -425,6 +474,15 @@ class TestAgeDataGaps:
         try:
             rows = glb._run_query(f'MATCH (p:Person) WHERE {where} RETURN p.name AS name ORDER BY p.name')
             assert [r['name'] for r in rows] == expected
+        finally:
+            glb.endGlobal()
+
+    def test_rewritten_parameter_query_runs(self, rr_env, age_graph):
+        # '$who IN []' is rewritten to 'false'; the supplied $who is still bound.
+        glb = _begin(rr_env)
+        try:
+            rows = glb._run_query('MATCH (p:Person) WHERE $who IN [] RETURN p.name AS name', params={'who': 'bob'})
+            assert rows == []
         finally:
             glb.endGlobal()
 

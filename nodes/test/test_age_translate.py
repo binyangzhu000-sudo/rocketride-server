@@ -243,13 +243,33 @@ class TestCapabilities:
             'MATCH (a:P {id: 1}), (b:P {id: 2}) MERGE (a)-[r:K]->(b) WITH r SET r.since = 1',
             'MATCH (a:P {id: 1}), (b:P {id: 2}) MERGE (a)-[`my rel`:K]->(b) SET `my rel`.since = 1',
             'MERGE (a:P {id: 1})-[r:K]->(b:P {id: 2}) SET a.seen = true, r.since = 1',
+            # A new end node of a path MERGE loses its SET too.
+            'MERGE (a:P {id: 10})-[:K]->(b:P {id: 11}) SET b.x = 1',
+            'MERGE (a:P {id: 10})-[:K]->(b:P {id: 11}) SET a.x = 1',
+            'MERGE (a:P {id: 10})-->(b:P {id: 11}) SET b.x = 1',
+            # A rename through WITH, a parenthesized target, and REMOVE.
+            'MATCH (a:P {id: 1}), (b:P {id: 2}) MERGE (a)-[r:K]->(b) WITH r AS e SET e.since = 1',
+            'MATCH (a:P {id: 1}), (b:P {id: 2}) MERGE (a)-[r:K]->(b) SET (r).since = 1',
+            'MATCH (a:P {id: 1}), (b:P {id: 2}) MERGE (a)-[r:K {since: 1}]->(b) REMOVE r.since',
+            'MATCH (a:P {id: 1}), (b:P {id: 2}) MERGE (a)-[r:K]->(b) REMOVE r:Old',
+            # A variable bound after the MERGE may be what the MERGE created.
+            'MATCH (a:P {id: 1}), (b:P {id: 2}) MERGE (a)-[r:K]->(b) WITH a MATCH (c:P {id: 2}) SET c.x = 1',
         ],
     )
-    def test_merge_relationship_set_rejected(self, query):
-        # AGE 1.5.0 drops a SET on an edge that MERGE creates, while RETURN
-        # still shows the new value — reject before the silent data loss.
-        with pytest.raises(age.AgeUnsupportedFeature, match='MERGE pattern'):
+    def test_write_after_relationship_merge_rejected(self, query):
+        # AGE 1.5.0 drops SET/REMOVE on what a relationship MERGE creates,
+        # while RETURN still shows the change — reject before the data loss.
+        with pytest.raises(age.AgeUnsupportedFeature, match='separate execute call'):
             age.translate(query, mode=RAW, graph_name='g')
+
+    def test_write_after_relationship_merge_message_leads_with_separate_call(self):
+        # Properties in the MERGE pattern are part of the match: on an existing
+        # edge with other values that creates a second edge, so it is not the
+        # first suggestion.
+        with pytest.raises(age.AgeUnsupportedFeature) as excinfo:
+            age.translate('MATCH (a), (b) MERGE (a)-[r:K]->(b) SET r.x = 1', mode=RAW, graph_name='g')
+        message = str(excinfo.value)
+        assert message.index('separate execute call') < message.index('second edge')
 
     @pytest.mark.parametrize(
         'query',
@@ -263,9 +283,16 @@ class TestCapabilities:
             'MATCH (a:P {id: 1}), (b:P {id: 2}) CREATE (a)-[r:K]->(b) SET r.since = 1',
             # SET on a MATCH-bound edge next to an unrelated MERGE.
             'MATCH (a:P)-[e:K]->(b:P) MERGE (a)-[r:L]->(b) SET e.since = 1',
+            # Variables bound before the MERGE stay writable through WITH.
+            'MATCH (a:P {id: 1}), (b:P {id: 2}) MERGE (a)-[r:K]->(b) WITH a SET a.seen = true',
+            'MATCH (a:P {id: 1}), (b:P {id: 2}) MERGE (a)-[r:K]->(b) WITH a AS z SET z.seen = true',
+            'MATCH (a:P {id: 1}), (b:P {id: 2}) MERGE (a)-[r:K]->(b) WITH * SET (a).seen = true',
+            # SET before the MERGE, and SET in another UNION branch.
+            'MATCH (a:P {id: 1}), (b:P {id: 2}) SET a.seen = true MERGE (a)-[r:K]->(b)',
+            'MATCH (a:P), (b:P) MERGE (a)-[r:K]->(b) RETURN 1 AS v UNION MATCH (a:P) SET a.x = 1 RETURN 2 AS v',
         ],
     )
-    def test_merge_relationship_set_lookalikes_pass(self, query):
+    def test_write_after_relationship_merge_lookalikes_pass(self, query):
         plan = age.translate(query, mode=RAW, graph_name='g')
         assert query in plan.statements[plan.result_index]
 
@@ -286,6 +313,10 @@ class TestCapabilities:
             ('MATCH (n) WHERE n.id IN [] IS NULL RETURN n.id', 'MATCH (n) WHERE false IS NULL RETURN n.id'),
             ('MATCH (n) WHERE (n.id IN []) IN [] RETURN n.id', 'MATCH (n) WHERE false RETURN n.id'),
             ('MATCH (n) WHERE n.id IN [1] IN [] RETURN n.id', 'MATCH (n) WHERE false RETURN n.id'),
+            # Comments, parentheses and spacing do not hide the empty list.
+            ('MATCH (n) WHERE n.id IN [/*c*/] RETURN n.id', 'MATCH (n) WHERE false RETURN n.id'),
+            ('MATCH (n) WHERE n.id IN ([]) RETURN n.id', 'MATCH (n) WHERE false RETURN n.id'),
+            ('MATCH (n) WHERE n.id IN ( [ ] ) RETURN n.id', 'MATCH (n) WHERE false RETURN n.id'),
         ],
     )
     def test_empty_list_in_rewritten_to_false(self, query, expected):
@@ -309,11 +340,20 @@ class TestCapabilities:
             "MATCH (n) WHERE n.note = 'x IN []' RETURN n.id",
             'MATCH (n) WHERE n.id IN [[]] RETURN n.id',
             'MATCH (n) WHERE [] IN n.lists RETURN n.id',
+            'MATCH (n) WHERE n.id IN ([1]) RETURN n.id',
+            'MATCH (n) WHERE n.id IN [] + [1] RETURN n.id',
         ],
     )
     def test_non_empty_in_left_alone(self, query):
         plan = age.translate(query, graph_name='g')
         assert query in plan.statements[plan.result_index]
+
+    def test_rewrite_keeps_parameter_names(self):
+        # '$who IN []' becomes 'false': the supplied $who must not trip the
+        # "parameters supplied but none referenced" check.
+        plan = age.translate('MATCH (n) WHERE $who IN [] RETURN n.id', params={'who': 'x'}, graph_name='g')
+        assert 'WHERE false' in plan.statements[plan.result_index - 1]
+        assert plan.binds[plan.result_index] == ('{"who": "x"}',)
 
     def test_empty_list_parameter_left_alone(self):
         # AGE evaluates an empty list passed as a $parameter correctly.
@@ -328,7 +368,13 @@ class TestCapabilities:
         # No cell remains unverified: every 1.5.0 cell has an empirical status.
         tbd = {k for k, cap in table.items() if cap.status is age.CellStatus.TBD}
         assert tbd == set()
-        for feature in ('merge_on_set', 'where_label_check', 'multi_label', 'shortest_path', 'merge_relationship_set'):
+        for feature in (
+            'merge_on_set',
+            'where_label_check',
+            'multi_label',
+            'shortest_path',
+            'merge_relationship_write',
+        ):
             assert table[feature].status is age.CellStatus.REJECT
         assert table['empty_list_in'].status is age.CellStatus.EMULATE
 

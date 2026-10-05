@@ -58,14 +58,21 @@ Probed against a container on the live pin (PG 16.14 + AGE 1.5.0 + pgvector
   execute CREATE TABLE in a read-only transaction").
 - `datetime()` does not exist on 1.5.0 (`ag_catalog.age_datetime` missing)
   → capability REJECT.
-- `MERGE` that creates an edge, followed by `SET` on that edge, stores the
-  edge **without** the property while `RETURN` shows the new value (SET on a
-  MERGE-bound node, SET on an edge MERGE matched, and properties inside the
-  MERGE pattern are all stored) → capability REJECT (`merge_relationship_set`).
-- A literal `x IN []` matches every row; under `NOT`, `AND` or in `RETURN` it
-  fails with `cache lookup failed for type 0`. An empty list passed as a
-  `$parameter` evaluates correctly → capability EMULATE (`empty_list_in`),
-  rewritten to `false`.
+- After a `MERGE` whose pattern has a relationship, changes to what that
+  MERGE creates are **not stored** while `RETURN` shows them: `SET` on the
+  new edge, `SET` on a new end node of a path MERGE, `SET` through a `WITH`
+  rename or `(r).p`, and `REMOVE`. A plain node `MERGE (n) SET n.p` and
+  properties inside the MERGE pattern are stored → capability REJECT
+  (`merge_relationship_write`): after a relationship MERGE, SET/REMOVE may only
+  change variables bound before it.
+- MERGE matches on every property in its pattern: with an edge `{prop: 1}`
+  already present, `MERGE (a)-[:REL {prop: 2}]->(b)` creates a second edge. So
+  the rejection message points to a separate `SET` call first.
+- An empty-list `x IN []` (also `[ /*c*/ ]`, `([])`) matches every row; under
+  `NOT`, `AND` or in `RETURN` it fails with `cache lookup failed for type 0`.
+  An empty list passed as a `$parameter` evaluates correctly → capability
+  EMULATE (`empty_list_in`), rewritten to `false`; the query keeps its
+  `$parameter` names, so a removed `$who IN []` does not break the params check.
 
 Both gaps above have canary tests in `nodes/test/test_rocketride_graph_full.py`
 that run the shape on AGE directly: when a canary fails after an AGE upgrade,

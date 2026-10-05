@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Set, Tuple
+from typing import Iterator, List, Optional, Set, Tuple
 
 from antlr4 import CommonTokenStream, InputStream, ParserRuleContext
 from antlr4.error.ErrorListener import ErrorListener
@@ -88,13 +88,14 @@ class CypherFacts:
     # ORDER BY references a bare projection alias rather than an expression
     # (capability: order_by_alias — AGE 1.5.0: 'could not find rte for <name>').
     has_order_by_alias: bool = False
-    # A SET targets a relationship variable bound by a MERGE pattern
-    # (capability: merge_relationship_set — AGE 1.5.0 drops the property when
-    # the MERGE creates the edge, while RETURN still shows the new value).
-    has_merge_relationship_set: bool = False
-    # Character spans (start, stop inclusive) of '<expr> IN []' with a literal
-    # empty list (capability: empty_list_in — AGE 1.5.0 matches every row, or
-    # fails with 'cache lookup failed for type 0' under NOT / AND / RETURN).
+    # A SET/REMOVE after a MERGE whose pattern has a relationship changes a
+    # variable not bound before that MERGE (capability:
+    # merge_relationship_write — AGE 1.5.0 drops the change on what the MERGE
+    # creates, while RETURN still shows the new value).
+    has_write_after_relationship_merge: bool = False
+    # Character spans (start, stop inclusive) of '<expr> IN <empty list>'
+    # (capability: empty_list_in — AGE 1.5.0 matches every row, or fails with
+    # 'cache lookup failed for type 0' under NOT / AND / RETURN).
     empty_in_spans: List[Tuple[int, int]] = field(default_factory=list)
 
     @property
@@ -155,32 +156,187 @@ def _parse_range_literal(text: str) -> Tuple[Optional[int], Optional[int]]:
     return (int(low_s) if low_s else None, int(high_s) if high_s else None)
 
 
-_LEADING_VARIABLE = re.compile(r'^\s*(`(?:[^`]|``)+`|[A-Za-z_][A-Za-z0-9_]*)')
+def _rule_children(ctx) -> List[ParserRuleContext]:
+    """Rule (non-token) children of a parse-tree context."""
+    return [c for c in (ctx.getChild(i) for i in range(ctx.getChildCount())) if isinstance(c, ParserRuleContext)]
 
 
-def _set_item_variable(item_ctx) -> Optional[str]:
-    """Variable a SET item writes to: ``r`` for ``r.p = 1`` / ``r = {...}`` / ``r += {...}``."""
-    match = _LEADING_VARIABLE.match(_source_text(item_ctx))
-    return _strip_backticks(match.group(1)) if match else None
+def _only_whitespace_tokens(ctx) -> bool:
+    """True when every token child of ``ctx`` is whitespace (SP, comments included)."""
+    for i in range(ctx.getChildCount()):
+        child = ctx.getChild(i)
+        if not isinstance(child, ParserRuleContext) and child.getSymbol().type != CypherParser.SP:
+            return False
+    return True
+
+
+def _unwrap(ctx) -> ParserRuleContext:
+    """Descend single-child chains and ``( ... )`` wrappers to the innermost context.
+
+    ``oC_Expression`` reaches a plain atom through a dozen single-child
+    levels; a level with an operator token (``NOT``, ``-``, ``+``) or a
+    second operand stops the descent, so the result is that level.
+    """
+    node = ctx
+    while True:
+        if isinstance(node, CypherParser.OC_ParenthesizedExpressionContext):
+            node = node.oC_Expression()
+            continue
+        if isinstance(node, (CypherParser.OC_VariableContext, CypherParser.OC_ListLiteralContext)):
+            return node
+        rules = _rule_children(node)
+        if len(rules) != 1 or not _only_whitespace_tokens(node):
+            return node
+        node = rules[0]
+
+
+def _bare_variable(ctx) -> Optional[str]:
+    """Variable name when ``ctx`` is only a variable (``r``, ``(r)``), else None."""
+    node = _unwrap(ctx)
+    if isinstance(node, CypherParser.OC_VariableContext):
+        return _strip_backticks(node.getText())
+    return None
+
+
+def _is_empty_list(ctx) -> bool:
+    """True when ``ctx`` is a list literal with no elements: ``[]``, ``[ /*c*/ ]``, ``([])``."""
+    node = _unwrap(ctx)
+    return isinstance(node, CypherParser.OC_ListLiteralContext) and not node.oC_Expression()
 
 
 def _empty_in_span(ctx) -> Optional[Tuple[int, int]]:
-    """Span of an oC_StringListNullPredicateExpression up to its last ``IN []``.
+    """Span of an oC_StringListNullPredicateExpression up to its last empty-list ``IN``.
 
     The predicate chain is left-associative, so everything before the last
     empty-list ``IN`` is that ``IN``'s left operand; the span covers the whole
     ``<lhs> IN []`` and later predicates (e.g. ``IS NULL``) stay outside it.
     """
     last = None
-    for i in range(ctx.getChildCount()):
-        child = ctx.getChild(i)
+    for child in _rule_children(ctx):
         if isinstance(child, CypherParser.OC_ListPredicateExpressionContext):
-            operand = child.oC_AddOrSubtractExpression()
-            if re.sub(r'\s+', '', operand.getText()) == '[]':
+            if _is_empty_list(child.oC_AddOrSubtractExpression()):
                 last = child
     if last is None:
         return None
     return (ctx.start.start, last.stop.stop)
+
+
+def _write_target(item_ctx) -> Optional[str]:
+    """Variable a SET/REMOVE item changes, or None when it cannot be named.
+
+    ``r.p = 1``, ``r = {...}``, ``r += {...}``, ``r:L`` and ``(r).p`` all give
+    ``'r'``; ``head(xs).p`` gives None.
+    """
+    variable = item_ctx.oC_Variable()
+    if variable is not None:
+        return _strip_backticks(variable.getText())
+    prop = item_ctx.oC_PropertyExpression()
+    return _bare_variable(prop.oC_Atom()) if prop is not None else None
+
+
+_BINDING_CONTEXTS = (
+    CypherParser.OC_NodePatternContext,
+    CypherParser.OC_RelationshipDetailContext,
+    CypherParser.OC_PatternPartContext,
+)
+
+
+def _pattern_variables(ctx) -> Set[str]:
+    """Path, node and relationship variables a pattern binds."""
+    names: Set[str] = set()
+
+    def visit(node) -> None:
+        if isinstance(node, _BINDING_CONTEXTS):
+            variable = node.oC_Variable()
+            if variable is not None:
+                names.add(_strip_backticks(variable.getText()))
+
+    _walk(ctx, visit)
+    return names
+
+
+def _has_relationship(ctx) -> bool:
+    """True when a pattern contains a relationship (``-[r]->``, ``-->``, ``--``)."""
+    found: List = []
+
+    def visit(node) -> None:
+        if isinstance(node, CypherParser.OC_RelationshipPatternContext):
+            found.append(node)
+
+    _walk(ctx, visit)
+    return bool(found)
+
+
+def _clauses(single_query) -> Iterator[ParserRuleContext]:
+    """Clauses of one oC_SingleQuery in source order: reading, updating, WITH, RETURN."""
+    for child in _rule_children(single_query):
+        if isinstance(child, (CypherParser.OC_SinglePartQueryContext, CypherParser.OC_MultiPartQueryContext)):
+            yield from _clauses(child)
+        elif isinstance(child, (CypherParser.OC_ReadingClauseContext, CypherParser.OC_UpdatingClauseContext)):
+            yield _rule_children(child)[0]
+        elif isinstance(child, (CypherParser.OC_WithContext, CypherParser.OC_ReturnContext)):
+            yield child
+
+
+def _project(items_ctx, bound: Set[str], safe: Optional[Set[str]]) -> Tuple[Set[str], Optional[Set[str]]]:
+    """Variables in scope (and safe to write) after a WITH projection.
+
+    ``WITH *`` keeps the scope; ``WITH a`` and ``WITH a AS x`` keep a safe
+    variable safe under its new name; any other projected name is unsafe.
+    """
+    star = items_ctx.getChild(0).getText() == '*'
+    new_bound = set(bound) if star else set()
+    new_safe = None if safe is None else (set(safe) if star else set())
+    for item in items_ctx.oC_ProjectionItem():
+        source = _bare_variable(item.oC_Expression())
+        alias = item.oC_Variable()
+        name = _strip_backticks(alias.getText()) if alias is not None else source
+        if name is None:
+            continue
+        new_bound.add(name)
+        if new_safe is not None:
+            if source is not None and source in safe:
+                new_safe.add(name)
+            else:
+                new_safe.discard(name)
+    return new_bound, new_safe
+
+
+def _writes_after_relationship_merge(single_query) -> bool:
+    """True when a SET/REMOVE after a relationship MERGE changes a variable not bound before it.
+
+    AGE 1.5.0 drops such changes on everything that MERGE creates — the new
+    edge and its new end nodes — while RETURN shows them. Writes stay allowed
+    on variables bound before the first relationship MERGE (kept through
+    WITH, plain or renamed); a target that cannot be named counts as unsafe.
+    """
+    bound: Set[str] = set()
+    # None until the first relationship MERGE; then the variables safe to write.
+    safe: Optional[Set[str]] = None
+    for clause in _clauses(single_query):
+        if isinstance(clause, (CypherParser.OC_SetContext, CypherParser.OC_RemoveContext)):
+            if safe is None:
+                continue
+            if isinstance(clause, CypherParser.OC_SetContext):
+                items = clause.oC_SetItem()
+            else:
+                items = clause.oC_RemoveItem()
+            if any(_write_target(item) not in safe for item in items):
+                return True
+        elif isinstance(clause, CypherParser.OC_MergeContext):
+            part = clause.oC_PatternPart()
+            if safe is None and _has_relationship(part):
+                safe = set(bound)
+            bound |= _pattern_variables(part)
+        elif isinstance(clause, (CypherParser.OC_MatchContext, CypherParser.OC_CreateContext)):
+            bound |= _pattern_variables(clause.oC_Pattern())
+        elif isinstance(clause, CypherParser.OC_UnwindContext):
+            bound.add(_strip_backticks(clause.oC_Variable().getText()))
+        elif isinstance(clause, CypherParser.OC_InQueryCallContext) and clause.oC_YieldItems() is not None:
+            bound |= {_strip_backticks(y.oC_Variable().getText()) for y in clause.oC_YieldItems().oC_YieldItem()}
+        elif isinstance(clause, CypherParser.OC_WithContext):
+            bound, safe = _project(clause.oC_ProjectionBody().oC_ProjectionItems(), bound, safe)
+    return False
 
 
 def _projection_column(item_ctx) -> ReturnColumn:
@@ -269,35 +425,23 @@ def analyze(query: str) -> CypherFacts:
             returns.append(node)
         if isinstance(node, CypherParser.OC_SortItemContext):
             sort_items.append(node.oC_Expression().getText())
-        if isinstance(node, CypherParser.OC_RelationshipDetailContext) and node.oC_Variable() is not None:
-            parent = node.parentCtx
-            while parent is not None and not isinstance(parent, CypherParser.OC_MergeContext):
-                parent = parent.parentCtx
-            if parent is not None:
-                merged_relationships.add(_strip_backticks(node.oC_Variable().getText()))
-        if isinstance(node, CypherParser.OC_SetItemContext):
-            variable = _set_item_variable(node)
-            if variable is not None:
-                set_variables.add(variable)
+        if isinstance(node, CypherParser.OC_SingleQueryContext):
+            single_queries.append(node)
         if isinstance(node, CypherParser.OC_StringListNullPredicateExpressionContext):
             span = _empty_in_span(node)
             if span is not None:
                 facts.empty_in_spans.append(span)
 
     sort_items: List[str] = []
-    merged_relationships: Set[str] = set()
-    set_variables: Set[str] = set()
+    # One entry per UNION branch: each has its own variable scope.
+    single_queries: List = []
     try:
         _walk(tree, visit)
+        facts.has_write_after_relationship_merge = any(_writes_after_relationship_merge(q) for q in single_queries)
     except RecursionError:
         raise AgeTranslationError(
             'Cypher expression is nested too deeply to analyze (reduce parenthesis/expression nesting)'
         ) from None
-
-    # Variable names are matched query-wide: a SET can only name a MERGE-bound
-    # relationship after that MERGE (or under a WITH that keeps the name),
-    # which is exactly the shape AGE 1.5.0 mishandles.
-    facts.has_merge_relationship_set = bool(merged_relationships & set_variables)
 
     if returns:
         # Multiple RETURNs at the same (shallowest) depth = UNION branches; all

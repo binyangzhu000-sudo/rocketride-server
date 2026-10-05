@@ -159,18 +159,22 @@ AGE_1_5_0: Dict[str, Capability] = {
                 'or an edge to a category node'
             ),
         ),
-        # --- verified 2026-10-02 against the datacore image (PG 16.15 +
-        # AGE 1.5.0): both shapes report success while storing or returning
-        # the wrong data. ---
+        # --- verified 2026-10-02 / 2026-10-05 against the datacore image
+        # (PG 16.15 + AGE 1.5.0): both shapes report success while storing or
+        # returning the wrong data. Lost writes after a relationship MERGE:
+        # SET on the new edge, SET on a new end node, SET through a WITH
+        # rename or '(r).p', and REMOVE. ---
         Capability(
-            feature='merge_relationship_set',
+            feature='merge_relationship_write',
             status=CellStatus.REJECT,
-            detect=lambda facts: facts.has_merge_relationship_set,
+            detect=lambda facts: facts.has_write_after_relationship_merge,
             detail=(
-                'AGE 1.5.0 drops a SET on a relationship created by MERGE (the RETURN shows the '
-                'new value, but nothing is stored); put the property in the MERGE pattern '
-                '(MERGE (a)-[r:REL {prop: ...}]->(b)) or run the SET as a separate statement '
-                '(MATCH (a)-[r:REL]->(b) SET r.prop = ...)'
+                'AGE 1.5.0 drops SET/REMOVE on what a relationship MERGE creates (the RETURN '
+                'shows the change, but nothing is stored); after such a MERGE, change only '
+                'variables bound before it. Run the SET/REMOVE as a separate execute call '
+                '(MATCH (a)-[r:REL]->(b) SET r.prop = ...). Properties inside the MERGE pattern '
+                'are stored, but MERGE matches on them, so on an existing edge with other '
+                'values it creates a second edge'
             ),
         ),
         Capability(
@@ -226,6 +230,9 @@ def apply_capabilities(facts: CypherFacts, age_version: str = DEFAULT_AGE_VERSIO
             from .analysis import analyze
 
             rewritten = analyze(cap.rewrite(facts))
+            # A rewrite may drop the only reference to a $parameter (e.g.
+            # '$who IN []' -> 'false'); the caller still supplies it.
+            rewritten.param_names = facts.param_names
             if (
                 facts.return_columns is not None
                 and rewritten.return_columns is not None
