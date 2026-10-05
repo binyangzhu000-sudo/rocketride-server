@@ -1114,6 +1114,30 @@ def test_f23_aimed_at_others_with_ack(engine, engine_config, driver_bot):
     )
 
 
+def test_f23b_reply_to_the_bot_is_answered(engine, engine_config, driver_bot):
+    # Review of #1503: the node looked up a reply's target with a method
+    # discord.py does not have, so every reply counted as aimed elsewhere.
+    tag = _tag('F23b')
+    _start(engine, _echo(_params(engine_config, ignoreAimedAtOthers=True, ackEmoji='\U0001f440')))
+    posted = driver_bot.post(f'{tag} first question')
+    answer = _answer(driver_bot, driver_bot.channel, posted, tag)
+    # A native reply with no ping: the bot is not in message.mentions, so only
+    # the reply-target lookup can tell the node this is for it.
+    reply = driver_bot.post(f'{tag} replying to the bot without a mention', reference=answer)
+    reply_answer = _answer(driver_bot, driver_bot.channel, reply, 'replying to the bot')
+    reactions = [str(r.emoji) for r in driver_bot.refetch(reply).reactions]
+    reason = _reason(engine, reply.id, timeout=3) if reply_answer is None else ''
+    _check(
+        'F23b',
+        'ignoreAimedAtOthers',
+        "a reply to the bot's own answer, without a mention",
+        'answered; no ack emoji, no aimed_elsewhere',
+        answer is not None and reply_answer is not None and '\U0001f440' not in reactions,
+        f'answered={reply_answer is not None}; reactions={reactions}; no_reply={reason or None}',
+        'driver reply has mention_author off, so the bot is not in its mentions',
+    )
+
+
 def test_f24_feedback_and_reaction_events(engine, engine_config, driver_bot):
     tag = _tag('F24')
     _start(engine, _echo(_params(engine_config, feedbackReactions=True, emitReactions=True)))

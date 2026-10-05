@@ -507,7 +507,7 @@ reachable with these pipes: the LLM layer reports a failure as answer text
 rather than raising. `reaction` add and remove (F24),
 `message` with `retry: 1` (F26), and `contextChars` (F20).
 
-### Node findings (all fixed 2026-10-03, tests first)
+### Node findings (all fixed, tests first: N1..N7 on 2026-10-03, N8 on 2026-10-05)
 
 | # | Severity | Found by | Finding | Fix | Verified live |
 |---|---|---|---|---|---|
@@ -518,6 +518,7 @@ rather than raising. `reaction` add and remove (F24),
 | N5 | low | F39 | An unset token variable reached the node as `${NAME}` and was reported as "login failed (invalid token)". | An unresolved `${NAME}` fails the start: "the bot token variable NAME is not set on this server". | F39 |
 | N6 | medium | F41 | No pipeline timeout. | Opt-in `pipelineTimeoutSeconds` (default 0, off): `no_reply` `timeout`, late answer dropped. Each run (question, attachment, retry) gets the full limit. | F41b: `timeout` after 15 s, nothing posted at 45 s |
 | N7 | low | F36 | The members-intent failure led with Message Content, which was already on. | With member metadata on: "enable the Server Members Intent ... (the Message Content Intent is required too)". | F36 |
+| N8 | high | PR review | The reply-target lookup called `Message.fetch_reference`, which discord.py does not have. The error was swallowed, so with `ignoreAimedAtOthers` on every reply without a mention, including a reply to the bot's own answer, got the ack emoji and no answer. F23 passed only because its reply targeted another user. The unit tests had mocked the missing method. | Read `reference.resolved`, then `reference.cached_message`, then `channel.fetch_message(reference.message_id)`; unit tests now delete `fetch_reference` from the fake message. | Unit tests; live case F23b added, not yet run (Ralph was running) |
 
 ### Observations (not node bugs)
 
