@@ -361,6 +361,10 @@ def services_defaults() -> Dict[str, Any]:
     return defaults
 
 
+class _ParsedConfig(Exception):
+    """Raised where ``IEndpoint._run()`` would reach the engine's shared web server."""
+
+
 def make_endpoint(bot, *, target: Optional[StubTarget] = None, **overrides):
     """Build an ``IEndpoint`` wired to ``bot`` and a ``StubTarget``.
 
@@ -370,8 +374,10 @@ def make_endpoint(bot, *, target: Optional[StubTarget] = None, **overrides):
     the typing indicator is only interesting in D14 and otherwise just adds
     Discord traffic to every test. Pass ``showTyping=True`` to exercise it.
 
-    The attribute assignments below mirror ``IEndpoint._run()``; keeping them in
-    lockstep is deliberate, so a renamed attribute in the node shows up here.
+    The config is parsed by the real ``IEndpoint._run()``, stopped where it
+    would reach the engine's shared web server, so the harness applies exactly
+    the defaults, coercions and clamps production does (no hand-kept copy to
+    drift out of step).
     """
     config = services_defaults()
     config['showTyping'] = False
@@ -379,6 +385,22 @@ def make_endpoint(bot, *, target: Optional[StubTarget] = None, **overrides):
 
     endpoint = IEndpoint.__new__(IEndpoint)
     endpoint.target = target if target is not None else StubTarget()
+    endpoint.endpoint = types.SimpleNamespace(serviceConfig={'parameters': config})
+
+    node = types.ModuleType('ai.node')
+    node.require_shared_web_server = mock.Mock(side_effect=_ParsedConfig())
+    node.server_loop = None
+    ai = types.ModuleType('ai')
+    ai.__path__ = []
+    ai.node = node
+    with mock.patch.dict(sys.modules, {'ai': ai, 'ai.node': node}):
+        try:
+            endpoint._run()
+        except _ParsedConfig:
+            pass
+        else:  # pragma: no cover - _run() always reaches the web server
+            raise RuntimeError('IEndpoint._run() returned before reaching the shared web server')
+
     endpoint._bot = bot
     endpoint._bot_task = None
     endpoint._inflight = set()
@@ -386,42 +408,6 @@ def make_endpoint(bot, *, target: Optional[StubTarget] = None, **overrides):
     endpoint._fatal_error = None
     endpoint._closing = False
     endpoint._backfill_done = False
-
-    coerce = IEndpoint._as_str_list
-    endpoint._bot_token = config.get('botToken', '')
-    endpoint._guild_ids = coerce(config.get('guildIds'))
-    endpoint._channel_ids = coerce(config.get('channelIds'))
-    endpoint._require_mention_channel_ids = coerce(config.get('requireMentionChannelIds'))
-    endpoint._allowed_bot_ids = coerce(config.get('allowedBotIds'))
-    endpoint._allowed_mention_role_ids = coerce(config.get('allowedMentionRoleIds'))
-    endpoint._allowed_mention_user_ids = coerce(config.get('allowedMentionUserIds'))
-    endpoint._ignore_bots = config['ignoreBots']
-    endpoint._require_mention = config['requireMention']
-    endpoint._reply_mode = config['replyMode']
-    endpoint._show_typing = config['showTyping']
-    endpoint._max_attachment_bytes = config['maxAttachmentBytes']
-    endpoint._send_responses = config['sendResponses']
-    endpoint._thread_name = config['threadName']
-    endpoint._thread_name_max_length = config['threadNameMaxLength']
-    endpoint._thread_auto_archive_minutes = config['threadAutoArchiveMinutes']
-    endpoint._text_attachment_extensions = [value.lower() for value in coerce(config['textAttachmentExtensions'])]
-    endpoint._text_attachment_max_chars = config['textAttachmentMaxChars']
-    endpoint._emit_reactions = config['emitReactions']
-    endpoint._emit_no_reply = config['emitNoReply']
-    endpoint._emit_outbound = config['emitOutbound']
-    endpoint._include_member_metadata = config['includeMemberMetadata']
-    endpoint._backfill_limit = config['backfillLimit']
-    endpoint._thread_history_limit = config['threadHistoryLimit']
-    endpoint._thread_history_max_chars = config['threadHistoryMaxChars']
-    endpoint._escalation_pause = config['escalationPause']
-    endpoint._escalation_markers = coerce(config['escalationMarkers'])
-    endpoint._ignore_aimed_at_others = config['ignoreAimedAtOthers']
-    endpoint._ack_emoji = str(config['ackEmoji'] or '')
-    endpoint._feedback_reactions = config['feedbackReactions']
-    endpoint._feedback_emojis = coerce(config['feedbackEmojis'])
-    endpoint._sanitize_replies = config['sanitizeReplies']
-    endpoint._paused_threads = set()
-    endpoint._resolved_threads = set()
     return endpoint
 
 

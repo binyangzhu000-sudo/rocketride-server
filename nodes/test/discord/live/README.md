@@ -128,7 +128,7 @@ status). That directory is gitignored.
 
 ## Node bugs or gaps found live
 
-**B1 — the privileged-intent failure message names the wrong intent.**
+**B1 — the privileged-intent failure message named the wrong intent (fixed, see N7).**
 `IEndpoint._bot_runner` maps every `discord.PrivilegedIntentsRequired` to
 `'Discord Bot: enable the Message Content Intent in the Developer Portal'`.
 D15 reproduces this with `includeMemberMetadata=true` on a bot whose **members**
@@ -141,15 +141,18 @@ and the node tells the operator to enable Message Content, which is already on.
 Operator-facing only (the source still fails fast, which is correct), but it
 sends whoever hits it to the wrong toggle. A fix would name the intents the node
 actually requested (`members` when `includeMemberMetadata`, `message_content`
-always). Not fixed here: the node is out of this change's scope.
+always). Fixed in this branch: with `includeMemberMetadata` on, the message now
+leads with the Server Members Intent (finding N7 below; verified live by F36).
 
-**G6 — a truncated `threadName` is not stripped.**
+**G6 — a truncated `threadName` was not stripped (fixed).**
 Discord silently strips leading/trailing whitespace from thread names, but
 `_send_chunk` truncates with `thread_name[:max]` and no `.strip()`. When the cut
 lands on a space, `thread.name` differs from the name the node asked for — so
 anything that later matches on the thread name (or re-derives it) will miss.
 D02c deliberately uses a content string whose cut lands on a non-space character
-so the assertion is about the node and not about Discord's normalization.
+so the assertion is about the node and not about Discord's normalization. Fixed
+in this branch: `_thread_name_for` strips the name after truncating; F03 cuts on
+a space and checks the stripped name.
 
 **Confirmed, not bugs** — live risks from plan section 7 that held up:
 `AllowedMentions(users=[discord.Object])` is accepted by the REST layer (D06c);
