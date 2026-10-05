@@ -441,13 +441,19 @@ class CaptureWriter:
         # Cleared first so anything still handling a Discord event stops
         # queueing rows the worker is no longer going to read.
         self._thread = None
+        stop_queued = True
         try:
             self._queue.put(_STOP, timeout=max(0.0, timeout))
         except queue.Full:
             # A full queue means well over `timeout` of work is outstanding;
             # the thread is a daemon, so leaving it is the bounded choice.
-            pass
+            stop_queued = False
         thread.join(timeout)
+        if thread.is_alive():
+            # Still busy (a write stuck on the database): whatever is queued is
+            # lost when the process exits, so say how much rather than nothing.
+            unwritten = max(0, self._queue.qsize() - (1 if stop_queued else 0))
+            self._warn(f'Discord capture: stopped with about {unwritten} row(s) unwritten (the writer was still busy)')
 
     def submit(self, row: Dict[str, Any]) -> None:
         """Queue one row. Never blocks, never raises."""

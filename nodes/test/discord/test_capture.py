@@ -34,6 +34,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import types
 from datetime import datetime, timezone
 from unittest import mock
@@ -771,6 +772,35 @@ class TestWriterThread:
             assert writer._thread.daemon is True
         finally:
             writer.stop(timeout=5.0)
+
+    def test_stop_reports_rows_it_could_not_write(self):
+        # A write stuck on the database outlives stop(); the worker is a daemon,
+        # so its queued rows are lost on exit. stop() says how many.
+        warnings = []
+        writer = _writer(_FakeTarget(_FakePipe()), warnings)
+        release = threading.Event()
+        writer._write_one = lambda row: release.wait(5)
+        writer.start()
+        try:
+            for _ in range(3):
+                writer.submit(_row())
+            deadline = time.time() + 2
+            while writer._queue.qsize() != 2 and time.time() < deadline:
+                time.sleep(0.01)  # the worker has taken the first row and is stuck on it
+            writer.stop(timeout=0.2)
+        finally:
+            release.set()
+
+        assert any('about 2 row(s) unwritten' in warning for warning in warnings), warnings
+
+    def test_a_clean_stop_reports_nothing_unwritten(self):
+        warnings = []
+        writer = _writer(_FakeTarget(_FakePipe()), warnings)
+        writer.start()
+        writer.submit(_row())
+        writer.stop(timeout=5.0)
+
+        assert not any('unwritten' in warning for warning in warnings)
 
     def test_stop_is_idempotent_and_safe_before_start(self):
         writer = _writer(_FakeTarget(_FakePipe()), [])
