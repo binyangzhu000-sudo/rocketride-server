@@ -18,7 +18,9 @@ the version gaps. This package is that translation, as a **pure transform**
 2. **Firewall** ([firewall.py](firewall.py)) — resource caps on **both**
    paths (query length, variable-length depth, statement timeout, size of the
    bound `$parameter` JSON — values bound as params skip the parser and the
-   query-length cap); semantic
+   query-length cap; a prepared statement survives ROLLBACK, so the caller
+   frees it inside the transaction when EXECUTE fails, see
+   `TranslatedQuery.prepared_name`); semantic
    read-only rules (no writes, no CALL) on the **safe** path only.
 3. **Dialect** ([capabilities.py](capabilities.py)) — capability table keyed
    by AGE version: `SUPPORTED` / `EMULATE` (rewrite hook; framework only in
@@ -60,6 +62,9 @@ Probed against a container on the live pin (PG 16.14 + AGE 1.5.0 + pgvector
   execute CREATE TABLE in a read-only transaction").
 - `datetime()` does not exist on 1.5.0 (`ag_catalog.age_datetime` missing)
   → capability REJECT.
+- `UNWIND $rows AS r MERGE (:L {id: r.id})` creates one node per row even
+  when rows repeat a key (MERGE does not see nodes created earlier in the
+  same statement): de-duplicate the list before binding it.
 
 ## Vendored code
 
