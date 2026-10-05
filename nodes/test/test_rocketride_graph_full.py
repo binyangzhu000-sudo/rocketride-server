@@ -442,6 +442,76 @@ class TestAgeDataGaps:
         finally:
             glb.endGlobal()
 
+    def test_canary_age_keeps_set_only_on_first_node_a_merge_creates(self, rr_env, age_graph):
+        _raw_cypher(
+            age_graph,
+            "UNWIND [{id: 1, x: 'a'}, {id: 2, x: 'b'}, {id: 3, x: 'c'}] AS row "
+            'MERGE (n:U {id: row.id}) SET n.x = row.x',
+        )
+        stored = _raw_cypher(age_graph, 'MATCH (n:U) RETURN n.id, n.x ORDER BY n.id', 'id agtype, x agtype')
+        assert stored == [('1', '"a"'), ('2', None), ('3', None)]
+
+    def test_canary_age_drops_set_on_second_merge(self, rr_env, age_graph):
+        _raw_cypher(age_graph, 'MERGE (a:X {id: 1}) MERGE (b:Y {id: 2}) SET a.v = 1, b.v = 1')
+        assert _raw_cypher(age_graph, 'MATCH (a:X), (b:Y) RETURN a.v, b.v', 'a agtype, b agtype') == [('1', None)]
+
+    def test_canary_age_drops_delete_on_merged_relationship(self, rr_env, age_graph):
+        _raw_cypher(
+            age_graph, "MATCH (a:Person {name:'alice'}), (b:Person {name:'carol'}) MERGE (a)-[r:MENTORS]->(b) DELETE r"
+        )
+        assert _raw_cypher(age_graph, 'MATCH ()-[r:MENTORS]->() RETURN count(r)', 'n agtype') == [('1',)]
+
+    @pytest.mark.parametrize(
+        'query',
+        [
+            "UNWIND [{id: 1, x: 'a'}, {id: 2, x: 'b'}] AS row MERGE (n:U {id: row.id}) SET n.x = row.x",
+            'MERGE (a:X {id: 1}) MERGE (b:Y {id: 2}) SET b.v = 1',
+            "MATCH (a:Person {name:'alice'}), (b:Person {name:'carol'}) MERGE (a)-[r:MENTORS]->(b) DELETE r",
+        ],
+    )
+    def test_unsafe_write_after_merge_rejected_before_db(self, rr_env, age_graph, query):
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = rr_env.iinstance_cls()
+        inst.IGlobal = glb
+        try:
+            with pytest.raises(Exception, match='separate execute call'):
+                inst.execute({'query': query})
+            # Nothing reached the database. (AGE 1.5.0 has no 'WHERE n:Label',
+            # so each label is counted on its own.)
+            for pattern in ('(n:U)', '(n:X)', '(n:Y)', '()-[n:MENTORS]->()'):
+                assert _raw_cypher(age_graph, f'MATCH {pattern} RETURN count(n)', 'n agtype') == [('0',)]
+        finally:
+            glb.endGlobal()
+
+    def test_bulk_upsert_as_merge_then_separate_set_stores_every_row(self, rr_env, age_graph):
+        # The form the rejection message recommends: MERGE, then MATCH ... SET.
+        rows = [{'id': 1, 'x': 'a'}, {'id': 2, 'x': 'b'}, {'id': 3, 'x': 'c'}]
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = rr_env.iinstance_cls()
+        inst.IGlobal = glb
+        try:
+            inst.execute({'query': 'UNWIND [{id: 1}, {id: 2}, {id: 3}] AS row MERGE (:U {id: row.id})'})
+            inst.execute(
+                {
+                    'query': "UNWIND [{id: 1, x: 'a'}, {id: 2, x: 'b'}, {id: 3, x: 'c'}] AS row "
+                    'MATCH (n:U {id: row.id}) SET n.x = row.x'
+                }
+            )
+            stored = glb._run_query('MATCH (n:U) RETURN n.id AS id, n.x AS x ORDER BY n.id')
+            assert stored == rows
+        finally:
+            glb.endGlobal()
+
+    def test_single_node_merge_opening_the_query_keeps_its_set(self, rr_env, age_graph):
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = rr_env.iinstance_cls()
+        inst.IGlobal = glb
+        try:
+            inst.execute({'query': 'MERGE (n:U {id: 7}) SET n.x = 1'})
+            assert glb._run_query('MATCH (n:U {id: 7}) RETURN n.x AS x') == [{'x': 1}]
+        finally:
+            glb.endGlobal()
+
     def test_merge_relationship_properties_in_pattern_are_stored(self, rr_env, age_graph):
         glb = _begin(rr_env, {'allow_execute': True})
         inst = rr_env.iinstance_cls()

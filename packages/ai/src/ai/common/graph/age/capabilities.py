@@ -159,22 +159,26 @@ AGE_1_5_0: Dict[str, Capability] = {
                 'or an edge to a category node'
             ),
         ),
-        # --- verified 2026-10-02 / 2026-10-05 against the datacore image
-        # (PG 16.15 + AGE 1.5.0): both shapes report success while storing or
-        # returning the wrong data. Lost writes after a relationship MERGE:
-        # SET on the new edge, SET on a new end node, SET through a WITH
-        # rename or '(r).p', and REMOVE. ---
+        # --- verified 2026-10-02 / 2026-10-05 / 2026-10-06 against the
+        # datacore image (PG 16.15 + AGE 1.5.0): both shapes report success
+        # while storing or returning the wrong data. SET/REMOVE/DELETE reach
+        # only the first entity a MERGE creates in a statement: later UNWIND /
+        # MATCH rows, a second MERGE, the far node and the edge of a path MERGE,
+        # and repeated SETs on a created node all lose the change; entities a
+        # MERGE matched and variables bound before it keep it. ---
         Capability(
-            feature='merge_relationship_write',
+            feature='merge_write',
             status=CellStatus.REJECT,
-            detect=lambda facts: facts.has_write_after_relationship_merge,
+            detect=lambda facts: facts.has_unsafe_write_after_merge,
             detail=(
-                'AGE 1.5.0 drops SET/REMOVE on what a relationship MERGE creates (the RETURN '
-                'shows the change, but nothing is stored); after such a MERGE, change only '
-                'variables bound before it. Run the SET/REMOVE as a separate execute call '
-                '(MATCH (a)-[r:REL]->(b) SET r.prop = ...). Properties inside the MERGE pattern '
-                'are stored, but MERGE matches on them, so on an existing edge with other '
-                'values it creates a second edge'
+                'AGE 1.5.0 applies SET/REMOVE/DELETE only to the first entity a MERGE creates '
+                'in a statement; changes to anything else it creates (later rows, a second '
+                'MERGE, a path MERGE) are dropped while the RETURN shows them. After a MERGE, '
+                'change only variables bound before it, or the node of a single-node MERGE '
+                'that starts the query. Run the MERGE, then the SET/REMOVE/DELETE as a separate '
+                'execute call (UNWIND $rows AS row MATCH (n:L {key: row.key}) SET n.prop = row.prop). '
+                'Properties inside the MERGE pattern are stored, but MERGE matches on them, so '
+                'with other values it creates a second node or edge'
             ),
         ),
         Capability(

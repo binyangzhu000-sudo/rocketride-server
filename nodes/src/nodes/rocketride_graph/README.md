@@ -52,12 +52,14 @@ the input is invalid, and otherwise returns {rows, affected_rows}.
 
 The translator also guards two AGE 1.5.0 gaps that would otherwise return wrong
 data without an error. An empty-list test such as `x IN []` is rewritten to
-`false`, its standard Cypher value. After a MERGE whose pattern has a
-relationship, a SET or REMOVE is rejected unless it changes a variable bound
-before that MERGE, because AGE does not store changes to what the MERGE
-creates. Run the SET or REMOVE as a separate execute call. Properties written
-inside the MERGE pattern are stored, but MERGE matches on them: on an existing
-edge with different values it creates a second edge.
+`false`, its standard Cypher value. AGE applies SET, REMOVE and DELETE only to
+the first node or edge a MERGE creates in a statement, so after a MERGE these
+are rejected unless they change a variable bound before that MERGE, or the node
+of a single-node MERGE that starts the query. For a bulk upsert, run the MERGE,
+then the SET as a separate execute call, for example
+`UNWIND $rows AS row MATCH (n:Item {id: row.id}) SET n.name = row.name`.
+Properties written inside the MERGE pattern are stored, but MERGE matches on
+them: with different values it creates a second node or edge.
 
 ## Configuration
 

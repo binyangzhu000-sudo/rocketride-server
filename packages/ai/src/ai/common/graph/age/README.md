@@ -58,13 +58,18 @@ Probed against a container on the live pin (PG 16.14 + AGE 1.5.0 + pgvector
   execute CREATE TABLE in a read-only transaction").
 - `datetime()` does not exist on 1.5.0 (`ag_catalog.age_datetime` missing)
   → capability REJECT.
-- After a `MERGE` whose pattern has a relationship, changes to what that
-  MERGE creates are **not stored** while `RETURN` shows them: `SET` on the
-  new edge, `SET` on a new end node of a path MERGE, `SET` through a `WITH`
-  rename or `(r).p`, and `REMOVE`. A plain node `MERGE (n) SET n.p` and
-  properties inside the MERGE pattern are stored → capability REJECT
-  (`merge_relationship_write`): after a relationship MERGE, SET/REMOVE may only
-  change variables bound before it.
+- `SET` / `REMOVE` / `DELETE` reach only the **first** entity a `MERGE`
+  creates in a statement; changes to every other entity a MERGE creates are
+  **not stored** while `RETURN` shows them: the 2nd and later rows of an
+  `UNWIND` or multi-row `MATCH`, the entity of a second MERGE, the far node and
+  the edge of a path MERGE (an edge a MERGE creates never keeps a SET), and
+  repeated SETs on a created node. Entities a MERGE *matched*, variables bound
+  before the first MERGE, and properties inside the MERGE pattern are stored.
+  → capability REJECT (`merge_write`): after the first MERGE, a write may only
+  target a variable bound before it, or the node of a single-node MERGE that
+  opens the query while no `MATCH`/`UNWIND`/`CALL` has multiplied rows (one
+  row, so it is the first entity created). The bulk-upsert form is MERGE, then
+  a separate `UNWIND $rows ... MATCH ... SET` call.
 - MERGE matches on every property in its pattern: with an edge `{prop: 1}`
   already present, `MERGE (a)-[:REL {prop: 2}]->(b)` creates a second edge. So
   the rejection message points to a separate `SET` call first.

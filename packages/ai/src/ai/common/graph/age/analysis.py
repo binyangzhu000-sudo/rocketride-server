@@ -88,11 +88,10 @@ class CypherFacts:
     # ORDER BY references a bare projection alias rather than an expression
     # (capability: order_by_alias — AGE 1.5.0: 'could not find rte for <name>').
     has_order_by_alias: bool = False
-    # A SET/REMOVE after a MERGE whose pattern has a relationship changes a
-    # variable not bound before that MERGE (capability:
-    # merge_relationship_write — AGE 1.5.0 drops the change on what the MERGE
-    # creates, while RETURN still shows the new value).
-    has_write_after_relationship_merge: bool = False
+    # A SET/REMOVE/DELETE after a MERGE targets something AGE 1.5.0 may drop
+    # the change on (capability: merge_write — AGE applies it only to the first
+    # entity a MERGE creates, while RETURN still shows the new value).
+    has_unsafe_write_after_merge: bool = False
     # Character spans (start, stop inclusive) of '<expr> IN <empty list>'
     # (capability: empty_list_in — AGE 1.5.0 matches every row, or fails with
     # 'cache lookup failed for type 0' under NOT / AND / RETURN).
@@ -278,15 +277,16 @@ def _clauses(single_query) -> Iterator[ParserRuleContext]:
             yield child
 
 
-def _project(items_ctx, bound: Set[str], safe: Optional[Set[str]]) -> Tuple[Set[str], Optional[Set[str]]]:
-    """Variables in scope (and safe to write) after a WITH projection.
+def _project(items_ctx, bound: Set[str], tracked: List[Set[str]]) -> Tuple[Set[str], List[Set[str]]]:
+    """Variables in scope after a WITH projection, and each tracked subset of them.
 
-    ``WITH *`` keeps the scope; ``WITH a`` and ``WITH a AS x`` keep a safe
-    variable safe under its new name; any other projected name is unsafe.
+    ``WITH *`` keeps the scope; ``WITH a`` and ``WITH a AS x`` keep a tracked
+    variable tracked under its new name; any other projected name drops out
+    of every tracked set.
     """
     star = items_ctx.getChild(0).getText() == '*'
     new_bound = set(bound) if star else set()
-    new_safe = None if safe is None else (set(safe) if star else set())
+    new_tracked = [set(t) if star else set() for t in tracked]
     for item in items_ctx.oC_ProjectionItem():
         source = _bare_variable(item.oC_Expression())
         alias = item.oC_Variable()
@@ -294,48 +294,84 @@ def _project(items_ctx, bound: Set[str], safe: Optional[Set[str]]) -> Tuple[Set[
         if name is None:
             continue
         new_bound.add(name)
-        if new_safe is not None:
-            if source is not None and source in safe:
-                new_safe.add(name)
+        for old, new in zip(tracked, new_tracked):
+            if source is not None and source in old:
+                new.add(name)
             else:
-                new_safe.discard(name)
-    return new_bound, new_safe
+                new.discard(name)
+    return new_bound, new_tracked
 
 
-def _writes_after_relationship_merge(single_query) -> bool:
-    """True when a SET/REMOVE after a relationship MERGE changes a variable not bound before it.
+def _write_targets(clause) -> List[Optional[str]]:
+    """Variables a SET/REMOVE/DELETE clause changes (None where one cannot be named)."""
+    if isinstance(clause, CypherParser.OC_SetContext):
+        return [_write_target(item) for item in clause.oC_SetItem()]
+    if isinstance(clause, CypherParser.OC_RemoveContext):
+        return [_write_target(item) for item in clause.oC_RemoveItem()]
+    return [_bare_variable(expr) for expr in clause.oC_Expression()]
 
-    AGE 1.5.0 drops such changes on everything that MERGE creates — the new
-    edge and its new end nodes — while RETURN shows them. Writes stay allowed
-    on variables bound before the first relationship MERGE (kept through
-    WITH, plain or renamed); a target that cannot be named counts as unsafe.
+
+_WRITE_CLAUSES = (CypherParser.OC_SetContext, CypherParser.OC_RemoveContext, CypherParser.OC_DeleteContext)
+
+# Clauses that can turn one row into many.
+_ROW_MULTIPLYING_CLAUSES = (
+    CypherParser.OC_MatchContext,
+    CypherParser.OC_UnwindContext,
+    CypherParser.OC_InQueryCallContext,
+)
+
+
+def _unsafe_write_after_merge(single_query) -> bool:
+    """True when a SET/REMOVE/DELETE after a MERGE changes something AGE 1.5.0 may drop.
+
+    AGE 1.5.0 applies these changes only to the first entity a MERGE creates
+    in a statement. Changes to every other entity a MERGE creates — on later
+    rows, by a second MERGE, the far node or the edge of a path MERGE — are
+    dropped while RETURN shows them. Whether a MERGE matches or creates, and
+    how many rows reach it, are unknown before execution, so after the first
+    MERGE a write may only target:
+
+    - a variable bound before that MERGE (a rename through WITH keeps it), or
+    - the node of a single-node MERGE that opens the query (one row, so it is
+      the first entity created), until a MATCH/UNWIND/CALL multiplies rows.
+
+    A target that cannot be named counts as unsafe.
     """
     bound: Set[str] = set()
-    # None until the first relationship MERGE; then the variables safe to write.
+    # None until the first MERGE; then the variables bound before it.
     safe: Optional[Set[str]] = None
-    for clause in _clauses(single_query):
-        if isinstance(clause, (CypherParser.OC_SetContext, CypherParser.OC_RemoveContext)):
+    # Node of a single-node MERGE that opens the query, while still one row.
+    opening: Set[str] = set()
+    for index, clause in enumerate(_clauses(single_query)):
+        if isinstance(clause, _WRITE_CLAUSES):
             if safe is None:
                 continue
-            if isinstance(clause, CypherParser.OC_SetContext):
-                items = clause.oC_SetItem()
-            else:
-                items = clause.oC_RemoveItem()
-            if any(_write_target(item) not in safe for item in items):
+            if any(t is None or (t not in safe and t not in opening) for t in _write_targets(clause)):
                 return True
-        elif isinstance(clause, CypherParser.OC_MergeContext):
+            continue
+        if isinstance(clause, CypherParser.OC_MergeContext):
             part = clause.oC_PatternPart()
-            if safe is None and _has_relationship(part):
+            introduced = _pattern_variables(part) - bound
+            if safe is None:
                 safe = set(bound)
-            bound |= _pattern_variables(part)
-        elif isinstance(clause, (CypherParser.OC_MatchContext, CypherParser.OC_CreateContext)):
+                if index == 0 and not _has_relationship(part):
+                    opening = introduced
+            bound |= introduced
+            continue
+        if isinstance(clause, _ROW_MULTIPLYING_CLAUSES):
+            opening = set()
+        if isinstance(clause, (CypherParser.OC_MatchContext, CypherParser.OC_CreateContext)):
             bound |= _pattern_variables(clause.oC_Pattern())
         elif isinstance(clause, CypherParser.OC_UnwindContext):
             bound.add(_strip_backticks(clause.oC_Variable().getText()))
         elif isinstance(clause, CypherParser.OC_InQueryCallContext) and clause.oC_YieldItems() is not None:
             bound |= {_strip_backticks(y.oC_Variable().getText()) for y in clause.oC_YieldItems().oC_YieldItem()}
         elif isinstance(clause, CypherParser.OC_WithContext):
-            bound, safe = _project(clause.oC_ProjectionBody().oC_ProjectionItems(), bound, safe)
+            items = clause.oC_ProjectionBody().oC_ProjectionItems()
+            if safe is None:
+                bound, _ = _project(items, bound, [])
+            else:
+                bound, (safe, opening) = _project(items, bound, [safe, opening])
     return False
 
 
@@ -437,7 +473,7 @@ def analyze(query: str) -> CypherFacts:
     single_queries: List = []
     try:
         _walk(tree, visit)
-        facts.has_write_after_relationship_merge = any(_writes_after_relationship_merge(q) for q in single_queries)
+        facts.has_unsafe_write_after_merge = any(_unsafe_write_after_merge(q) for q in single_queries)
     except RecursionError:
         raise AgeTranslationError(
             'Cypher expression is nested too deeply to analyze (reduce parenthesis/expression nesting)'

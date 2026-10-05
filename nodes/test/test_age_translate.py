@@ -254,22 +254,31 @@ class TestCapabilities:
             'MATCH (a:P {id: 1}), (b:P {id: 2}) MERGE (a)-[r:K]->(b) REMOVE r:Old',
             # A variable bound after the MERGE may be what the MERGE created.
             'MATCH (a:P {id: 1}), (b:P {id: 2}) MERGE (a)-[r:K]->(b) WITH a MATCH (c:P {id: 2}) SET c.x = 1',
+            # Node MERGEs: only the first entity a MERGE creates keeps a write.
+            "UNWIND [{id: 1, x: 'a'}, {id: 2, x: 'b'}] AS row MERGE (n:U {id: row.id}) SET n.x = row.x",
+            'MATCH (p:P) MERGE (q:Q {name: p.name}) SET q.x = 1',
+            'MERGE (a:X {id: 1}) MERGE (b:Y {id: 2}) SET b.x = 1',
+            'MERGE (n:L {id: 1}) WITH n UNWIND [1, 2, 3] AS i SET n.c = i',
+            'MERGE (n:L {id: 1}) WITH n MATCH (m:M) SET n.c = 1',
+            # DELETE is dropped the same way.
+            'MATCH (a:P {id: 1}), (b:P {id: 2}) MERGE (a)-[r:K]->(b) DELETE r',
+            'UNWIND [1, 2] AS i MERGE (n:U {id: i}) DELETE n',
         ],
     )
-    def test_write_after_relationship_merge_rejected(self, query):
-        # AGE 1.5.0 drops SET/REMOVE on what a relationship MERGE creates,
-        # while RETURN still shows the change — reject before the data loss.
+    def test_unsafe_write_after_merge_rejected(self, query):
+        # AGE 1.5.0 applies SET/REMOVE/DELETE only to the first entity a MERGE
+        # creates, while RETURN still shows the change — reject before the loss.
         with pytest.raises(age.AgeUnsupportedFeature, match='separate execute call'):
             age.translate(query, mode=RAW, graph_name='g')
 
-    def test_write_after_relationship_merge_message_leads_with_separate_call(self):
+    def test_unsafe_write_after_merge_message_leads_with_separate_call(self):
         # Properties in the MERGE pattern are part of the match: on an existing
         # edge with other values that creates a second edge, so it is not the
         # first suggestion.
         with pytest.raises(age.AgeUnsupportedFeature) as excinfo:
             age.translate('MATCH (a), (b) MERGE (a)-[r:K]->(b) SET r.x = 1', mode=RAW, graph_name='g')
         message = str(excinfo.value)
-        assert message.index('separate execute call') < message.index('second edge')
+        assert message.index('separate execute call') < message.index('second node or edge')
 
     @pytest.mark.parametrize(
         'query',
@@ -290,9 +299,18 @@ class TestCapabilities:
             # SET before the MERGE, and SET in another UNION branch.
             'MATCH (a:P {id: 1}), (b:P {id: 2}) SET a.seen = true MERGE (a)-[r:K]->(b)',
             'MATCH (a:P), (b:P) MERGE (a)-[r:K]->(b) RETURN 1 AS v UNION MATCH (a:P) SET a.x = 1 RETURN 2 AS v',
+            # The node of a single-node MERGE that opens the query is the first
+            # entity created (one row), so writes on it are stored.
+            'MERGE (n:P {id: 1}) WITH n AS m SET m.seen = true',
+            'MERGE (a:X {id: 1}) MERGE (b:Y {id: 2}) SET a.x = 1',
+            'MERGE (n:P {id: 1}) DELETE n',
+            # Variables bound before the MERGE keep writes on every row.
+            'MATCH (p:P) MERGE (q:Q {name: p.name}) SET p.seen = true',
+            # No MERGE at all: the bulk-update form the message recommends.
+            "UNWIND [{id: 1, x: 'a'}] AS row MATCH (n:U {id: row.id}) SET n.x = row.x",
         ],
     )
-    def test_write_after_relationship_merge_lookalikes_pass(self, query):
+    def test_safe_writes_around_merge_pass(self, query):
         plan = age.translate(query, mode=RAW, graph_name='g')
         assert query in plan.statements[plan.result_index]
 
@@ -373,7 +391,7 @@ class TestCapabilities:
             'where_label_check',
             'multi_label',
             'shortest_path',
-            'merge_relationship_write',
+            'merge_write',
         ):
             assert table[feature].status is age.CellStatus.REJECT
         assert table['empty_list_in'].status is age.CellStatus.EMULATE
