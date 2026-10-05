@@ -1143,6 +1143,36 @@ class IEndpoint(IEndpointBase):
             entries.append((str(name), str(content)))
         return format_thread_transcript(entries, getattr(self, '_thread_history_max_chars', 6000))
 
+    @staticmethod
+    async def _replied_to_message(message: discord.Message) -> Any:
+        """The message ``message`` replies to, as discord.py exposes it.
+
+        discord.py has no ``Message.fetch_reference``. The Gateway usually sends
+        the replied-to message along (``reference.resolved``), discord.py may
+        hold it in its cache (``reference.cached_message``), and otherwise it is
+        fetched by id from the channel. A deleted target resolves to an object
+        without an author, so it falls through to the fetch, which then fails.
+
+        Args:
+            message (discord.Message): The reply.
+
+        Returns:
+            Any: The replied-to message, or None when the message is not a reply.
+
+        Raises:
+            Exception: Whatever the fetch raises (not found, no permission).
+        """
+        reference = getattr(message, 'reference', None)
+        if reference is None:
+            return None
+        for candidate in (getattr(reference, 'resolved', None), getattr(reference, 'cached_message', None)):
+            if candidate is not None and getattr(candidate, 'author', None) is not None:
+                return candidate
+        message_id = getattr(reference, 'message_id', None)
+        if message_id is None:
+            return None
+        return await message.channel.fetch_message(message_id)
+
     async def _aimed_at_someone_else(self, message: discord.Message) -> bool:
         """Whether this message belongs to someone else's conversation.
 
@@ -1169,11 +1199,12 @@ class IEndpoint(IEndpointBase):
         reply_target_is_bot = None
         if is_reply and not is_mentioned:
             try:
-                referenced = await message.fetch_reference()
+                referenced = await self._replied_to_message(message)
                 author = getattr(referenced, 'author', None)
-                reply_target_is_bot = getattr(author, 'id', None) == bot_user_id
+                if author is not None:
+                    reply_target_is_bot = getattr(author, 'id', None) == bot_user_id
             except Exception as e:
-                debug(f'Discord: fetch_reference failed: {e}')
+                debug(f'Discord: could not look up the message replied to: {e}')
 
         return is_aimed_at_someone_else(
             is_bot_mentioned=is_mentioned,

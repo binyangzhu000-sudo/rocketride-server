@@ -1093,22 +1093,75 @@ class TestAimedAtSomeoneElse:
         message.add_reaction.assert_not_awaited()
         endpoint._run_with_optional_typing.assert_awaited_once()
 
-    def test_reply_to_the_bot_is_answered_and_other_replies_are_not(self):
-        endpoint = self._endpoint()
+    @staticmethod
+    def _reply(*, resolved=None, cached=None, fetched=None, fetch_error=None):
+        """A reply as discord.py delivers it: the target on ``reference``, never a method.
+
+        discord.py has no ``Message.fetch_reference``; deleting it from the mock
+        makes any code that still calls it fail the test instead of passing.
+        """
         message = _make_message(content='a reply')
-        message.reference = types.SimpleNamespace(message_id=42)
+        del message.fetch_reference
+        message.reference = types.SimpleNamespace(message_id=42, resolved=resolved, cached_message=cached)
+        message.channel.fetch_message = mock.AsyncMock(return_value=fetched, side_effect=fetch_error)
         message.add_reaction = mock.AsyncMock()
-        own = mock.Mock()
-        own.author.id = 999
-        message.fetch_reference = mock.AsyncMock(return_value=own)
+        return message
+
+    @staticmethod
+    def _author(user_id):
+        target = mock.Mock()
+        target.author.id = user_id
+        return target
+
+    def test_a_reply_to_the_bot_is_answered(self):
+        # Live review of #1503: the node called Message.fetch_reference, which does
+        # not exist, so every reply looked aimed at someone else.
+        endpoint = self._endpoint()
+        message = self._reply(resolved=self._author(999))
 
         asyncio.run(endpoint._process_message(message))
+
+        endpoint._run_with_optional_typing.assert_awaited_once()
+        message.add_reaction.assert_not_awaited()
+        message.channel.fetch_message.assert_not_awaited()  # resolved needs no API call
+
+    def test_a_reply_to_someone_else_is_acknowledged(self):
+        endpoint = self._endpoint()
+        message = self._reply(resolved=self._author(5))
+
+        asyncio.run(endpoint._process_message(message))
+
+        endpoint._run_with_optional_typing.assert_not_awaited()
+        message.add_reaction.assert_awaited_once()
+
+    def test_the_cached_message_is_used_when_not_resolved(self):
+        endpoint = self._endpoint()
+        message = self._reply(cached=self._author(999))
+
+        asyncio.run(endpoint._process_message(message))
+
+        endpoint._run_with_optional_typing.assert_awaited_once()
+        message.channel.fetch_message.assert_not_awaited()
+
+    def test_the_target_is_fetched_by_id_as_a_last_resort(self):
+        endpoint = self._endpoint()
+        message = self._reply(fetched=self._author(999))
+
+        asyncio.run(endpoint._process_message(message))
+
+        message.channel.fetch_message.assert_awaited_once_with(42)
         endpoint._run_with_optional_typing.assert_awaited_once()
 
-        other = mock.Mock()
-        other.author.id = 5
-        message.fetch_reference = mock.AsyncMock(return_value=other)
+    def test_a_deleted_target_is_fetched_and_an_unknown_target_is_someone_else(self):
+        # discord.py resolves a deleted target to DeletedReferencedMessage, which
+        # has no author; the fetch then fails, and the reply counts as aimed elsewhere.
+        endpoint = self._endpoint()
+        message = self._reply(resolved=types.SimpleNamespace(id=42), fetch_error=RuntimeError('404 Unknown Message'))
+
         asyncio.run(endpoint._process_message(message))
+
+        message.channel.fetch_message.assert_awaited_once_with(42)
+        endpoint._run_with_optional_typing.assert_not_awaited()
         message.add_reaction.assert_awaited_once()
 
     def test_aimed_elsewhere_in_a_thread_pauses_it(self):
