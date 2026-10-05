@@ -14,9 +14,13 @@ const BUILD_ROOT = process.env.ROCKETRIDE_BUILD_ROOT || path.join(PROJECT_ROOT, 
 /** Distribution directory for final outputs */
 const DIST_ROOT = process.env.ROCKETRIDE_DIST_ROOT || path.join(PROJECT_ROOT, 'dist');
 
+/** Overlay repo building this one as a submodule; null for a plain build */
+const OVERLAY_ROOT = process.env.ROCKETRIDE_OVERLAY_ROOT || null;
+
 module.exports = {
     PROJECT_ROOT,
     BUILD_ROOT,
-    DIST_ROOT
+    DIST_ROOT,
+    OVERLAY_ROOT
 };
 
