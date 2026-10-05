@@ -98,7 +98,7 @@ Attachments larger than this (default 25 MB) are skipped without being downloade
 
 `ignoreBots` (default `true`) drops messages from other bots to prevent loops; the bot never processes its own messages regardless. `sendResponses` (default `true`), when set to `false`, still ingests every message into the pipeline but posts nothing back. `showTyping` (default `true`) shows a typing indicator while the pipeline runs.
 
-The node tile shows connection status (pending or connected), and the monitor panel shows only the last 6 characters of the token so you can confirm which bot is connected without exposing the secret.
+The node tile shows whether a bot token is configured (`Token: configured` or `Token: missing`); it does not report whether the bot connected, which the task's status line does. The monitor panel shows only the last 6 characters of the token so you can confirm which bot is connected without exposing the secret.
 
 ## Authentication
 

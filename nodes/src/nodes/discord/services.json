@@ -16,7 +16,7 @@
 	],
 	"icon": "discord.svg",
 	"documentation": "https://docs.rocketride.org/nodes/discord",
-	"tile": ["Status: ${parameters.discord.botToken ? 'connected' : 'pending'}"],
+	"tile": ["Token: ${parameters.discord.botToken ? 'configured' : 'missing'}"],
 	"lanes": {
 		"_source": ["text", "image", "audio", "video", "tags"]
 	},
