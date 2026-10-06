@@ -736,8 +736,8 @@
 			// See llm_gmi_cloud: protected until the first run's list has been reviewed.
 			"protected_profiles": [
 				["custom", "2126-04-09"],
-				["deepseek-v3-1-terminus", "2027-04-06"],
-				["glm-4-7", "2027-04-06"]
+				["deepseek-v4-flash", "2027-04-06"],
+				["glm-5-3-flash", "2027-04-06"]
 			],
 			"default_context_window": 131072
 		},

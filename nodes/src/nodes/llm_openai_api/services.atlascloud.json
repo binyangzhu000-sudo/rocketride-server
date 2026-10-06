@@ -72,26 +72,26 @@
 	//		(no per-node os.environ lookup needed).
 	//
 	"preconfig": {
-		"default": "deepseek-v3-1-terminus",
+		"default": "deepseek-v4-flash",
 		"profiles": {
-			"deepseek-v3-1-terminus": {
-				"title": "DeepSeek V3.1 Terminus",
-				"model": "deepseek-ai/DeepSeek-V3.1-Terminus",
+			"deepseek-v4-flash": {
+				"title": "DeepSeek V4 Flash",
+				"model": "deepseek-ai/deepseek-v4-flash",
 				"modelSource": "provider",
 				"base_url": "https://api.atlascloud.ai/v1/",
-				"modelTotalTokens": 131072,
+				"modelTotalTokens": 1048576,
 				"modelOutputTokens": 4096,
 				"apikey": "${ROCKETRIDE_ATLASCLOUD_KEY}",
 				"capabilities": {
 					"reasoning": true
 				}
 			},
-			"glm-4-7": {
-				"title": "GLM 4.7",
-				"model": "zai-org/glm-4.7",
+			"glm-5-3-flash": {
+				"title": "GLM-5.3 Flash",
+				"model": "zai-org/glm-5.3-flash",
 				"modelSource": "provider",
 				"base_url": "https://api.atlascloud.ai/v1/",
-				"modelTotalTokens": 202752,
+				"modelTotalTokens": 1048576,
 				"modelOutputTokens": 4096,
 				"apikey": "${ROCKETRIDE_ATLASCLOUD_KEY}",
 				"capabilities": {
@@ -115,7 +115,7 @@
 		"model": {
 			"type": "string",
 			"title": "Model",
-			"description": "Atlas Cloud model id (e.g. deepseek-ai/DeepSeek-V3.1-Terminus). Full list: https://api.atlascloud.ai/v1/models"
+			"description": "Atlas Cloud model id (e.g. deepseek-ai/deepseek-v4-flash). Full list: https://api.atlascloud.ai/v1/models"
 		},
 		"base_url": {
 			"type": "string",
@@ -134,12 +134,12 @@
 			"minimum": 1024,
 			"optional": true
 		},
-		"openai_api.deepseek-v3-1-terminus": {
-			"object": "deepseek-v3-1-terminus",
+		"openai_api.deepseek-v4-flash": {
+			"object": "deepseek-v4-flash",
 			"properties": ["llm.cloud.apikey"]
 		},
-		"openai_api.glm-4-7": {
-			"object": "glm-4-7",
+		"openai_api.glm-5-3-flash": {
+			"object": "glm-5-3-flash",
 			"properties": ["llm.cloud.apikey"]
 		},
 		"openai_api.custom": {
@@ -150,16 +150,16 @@
 			"title": "Model",
 			"description": "Atlas Cloud model",
 			"type": "string",
-			"default": "deepseek-v3-1-terminus",
+			"default": "deepseek-v4-flash",
 			"enum": ["*>preconfig.profiles.*.title"],
 			"conditional": [
 				{
-					"value": "deepseek-v3-1-terminus",
-					"properties": ["openai_api.deepseek-v3-1-terminus"]
+					"value": "deepseek-v4-flash",
+					"properties": ["openai_api.deepseek-v4-flash"]
 				},
 				{
-					"value": "glm-4-7",
-					"properties": ["openai_api.glm-4-7"]
+					"value": "glm-5-3-flash",
+					"properties": ["openai_api.glm-5-3-flash"]
 				},
 				{
 					"value": "custom",

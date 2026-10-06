@@ -30,11 +30,11 @@ and message, truncated to 500 characters.
 
 Generic endpoint default: **Custom OpenAI-compatible endpoint** (`custom`).
 Nebius preset default: **Llama 3.3 70B Instruct** (`llama-3-3-70b`).
-Atlas Cloud preset default: **DeepSeek V3.1 Terminus** (`deepseek-v3-1-terminus`).
+Atlas Cloud preset default: **DeepSeek V4 Flash** (`deepseek-v4-flash`).
 
 Each default belongs to its own registration: `custom` to the generic
 OpenAI-compatible service, `llama-3-3-70b` to the Nebius preset, and
-`deepseek-v3-1-terminus` to the Atlas Cloud preset. The directory documents all
+`deepseek-v4-flash` to the Atlas Cloud preset. The directory documents all
 three in one combined profile table.
 
 | Profile | Model | Context tokens | Source |
@@ -43,8 +43,8 @@ three in one combined profile table.
 | `llama-3-3-70b` **(default)** | `meta-llama/Llama-3.3-70B-Instruct` | 131,072 | Nebius Token Factory |
 | `qwen3-235b` | `Qwen/Qwen3-235B-A22B` | 131,072 | Nebius Token Factory |
 | `deepseek-v3` | `deepseek-ai/DeepSeek-V3` | 131,072 | Nebius Token Factory |
-| `deepseek-v3-1-terminus` **(default)** | `deepseek-ai/DeepSeek-V3.1-Terminus` | 131,072 | Atlas Cloud |
-| `glm-4-7` | `zai-org/glm-4.7` | 202,752 | Atlas Cloud |
+| `deepseek-v4-flash` **(default)** | `deepseek-ai/deepseek-v4-flash` | 1,048,576 | Atlas Cloud |
+| `glm-5-3-flash` | `zai-org/glm-5.3-flash` | 1,048,576 | Atlas Cloud |
 
 ## Configuration
 
